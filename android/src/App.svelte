@@ -158,6 +158,15 @@
     if (showingLikedPodcasts) podcastFeeds = [...likedPodcasts];
   }
 
+  function usePodcastArtwork(event: Event, fallback: string) {
+    const image = event.currentTarget as HTMLImageElement;
+    if (fallback && image.getAttribute('src') !== fallback) {
+      image.src = fallback;
+    } else {
+      image.remove();
+    }
+  }
+
   function showLikedTracks() {
     musicViewVersion += 1;
     showingLikedMusic = !showingLikedMusic;
@@ -1091,9 +1100,18 @@
           {#if podcastLoading}<div class="loading-list"><i></i><span>Loading episodes…</span></div>{/if}
           {#each podcastEpisodes as episode (episode.id)}
             {@const download = podcastDownloadFor(episode.id)}
+            {@const episodeImage = episode.image || selectedPodcast.image}
             <article class="episode-row">
-              <button class="episode-play" onclick={() => playPodcast(episode)}>▶</button>
-              <button class="episode-copy" onclick={() => playPodcast(episode)}><strong>{episode.title}</strong><small>{podcastDate(episode.datePublished)}{episode.duration ? ` · ${clock(episode.duration)}` : ''}</small></button>
+              <button class="episode-art" onclick={() => playPodcast(episode)} aria-label={`Play ${episode.title}`}>
+                <span class="podcast-art-fallback">◉</span>
+                {#if episodeImage}<img src={episodeImage} alt="" onerror={(event) => usePodcastArtwork(event, selectedPodcast!.image)} />{/if}
+                <i aria-hidden="true">▶</i>
+              </button>
+              <button class="episode-copy" onclick={() => playPodcast(episode)}>
+                <strong>{episode.title}</strong>
+                {#if episode.description}<span>{episode.description}</span>{/if}
+                <small>{podcastDate(episode.datePublished)}{episode.duration ? ` · ${clock(episode.duration)}` : ''}</small>
+              </button>
               <button class:ready={download?.ready} class="episode-download" onclick={() => downloadPodcast(episode)} disabled={download?.status === 'Downloading'} aria-label={`Download ${episode.title}`} title={download?.status || 'Download for offline listening'}>{download?.ready ? '✓' : download?.status === 'Downloading' ? `${Math.round(download.progress)}%` : '⇩'}</button>
             </article>
           {/each}

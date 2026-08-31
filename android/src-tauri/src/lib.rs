@@ -2436,6 +2436,7 @@ mod tests {
         assert_eq!(episodes[0].feed_title, "Independent show");
         assert_eq!(episodes[0].duration, 3_723);
         assert_eq!(episodes[0].enclosure_length, 1_234);
+        assert_eq!(episodes[0].image, feed.image);
     }
 
     #[test]

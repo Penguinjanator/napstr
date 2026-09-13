@@ -2,7 +2,7 @@ use futures_util::StreamExt;
 use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use napstr_remote_protocol::{
     ClientRequest, PairingTicket, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack,
-    RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES,
+    RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_STREAM_CHUNK_BYTES,
 };
 use quick_xml::{events::Event, Reader};
 use serde::{Deserialize, Serialize};
@@ -30,11 +30,14 @@ struct SavedDesktop {
     endpoint_id: String,
     endpoint_addr: String,
     desktop_name: String,
+    #[serde(default)]
+    stream_only: bool,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompanionStatus {
+    stream_only: bool,
     paired: bool,
     connected: bool,
     desktop_name: String,
@@ -53,6 +56,7 @@ struct LibraryPage {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OfflineLibrary {
+    stream_only: bool,
     tracks: Vec<RemoteTrack>,
     total: usize,
     paired: bool,
@@ -246,10 +250,55 @@ impl MediaEntry {
     }
 }
 
+struct StreamingEntry {
+    track: RemoteTrack,
+    remote: Arc<RemoteClient>,
+    generation: u64,
+    current_generation: Arc<AtomicU64>,
+}
+
+impl StreamingEntry {
+    async fn chunk(&self, offset: u64, length: u64) -> Result<Vec<u8>, String> {
+        if self.current_generation.load(Ordering::Acquire) != self.generation {
+            return Err("The pairing changed; select the track again".into());
+        }
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (response, mut receive) = self
+                .remote
+                .exchange(ClientRequest::StreamAudio {
+                    file_id: self.track.file_id.clone(),
+                    offset,
+                    length,
+                })
+                .await?;
+            match response {
+                ServerResponse::AudioReady { track } => {
+                    validate_matching_track(&self.track, &track)?
+                }
+                other => return Err(unexpected_response(&other)),
+            }
+            let bytes = receive
+                .read_to_end(length as usize)
+                .await
+                .map_err(|error| error.to_string())?;
+            if bytes.len() as u64 != length {
+                return Err("Incomplete audio stream".into());
+            }
+            if self.current_generation.load(Ordering::Acquire) != self.generation {
+                return Err("The pairing changed; select the track again".into());
+            }
+            Ok(bytes)
+        })
+        .await
+        .map_err(|_| "Audio stream timed out".to_string())?
+    }
+}
+
 struct MediaServer {
     port: u16,
     token: String,
     entries: RwLock<HashMap<String, Arc<MediaEntry>>>,
+    streams: RwLock<HashMap<String, Arc<StreamingEntry>>>,
     prepare_lock: Mutex<()>,
     scheduled_prefetches: Mutex<HashSet<(String, String)>>,
 }
@@ -270,6 +319,7 @@ impl MediaServer {
             port,
             token,
             entries: RwLock::new(HashMap::new()),
+            streams: RwLock::new(HashMap::new()),
             prepare_lock: Mutex::new(()),
             scheduled_prefetches: Mutex::new(HashSet::new()),
         });
@@ -365,8 +415,14 @@ impl MediaServer {
         }
         let (file_id, extension) = requested.rsplit_once('.').ok_or("invalid audio ID")?;
         validate_file_id(file_id)?;
-        let entry = self.entry(file_id).await.ok_or("audio is not prepared")?;
-        if safe_extension(&entry.track.format)? != extension {
+        let stream = self.streams.read().await.get(file_id).cloned();
+        let entry = self.entry(file_id).await;
+        let track = stream
+            .as_ref()
+            .map(|entry| &entry.track)
+            .or_else(|| entry.as_ref().map(|entry| &entry.track))
+            .ok_or("audio is not prepared")?;
+        if safe_extension(&track.format)? != extension {
             return write_http_error(&mut socket, 404, "Not Found").await;
         }
         let range_header = lines.find_map(|line| {
@@ -374,12 +430,12 @@ impl MediaServer {
             name.eq_ignore_ascii_case("range")
                 .then(|| value.trim().to_string())
         });
-        let range = match requested_audio_range(range_header.as_deref(), entry.track.size) {
+        let range = match requested_audio_range(range_header.as_deref(), track.size) {
             Ok(range) => range,
             Err(()) => {
                 let response = format!(
                     "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nConnection: close\r\n\r\n",
-                    entry.track.size
+                    track.size
                 );
                 socket
                     .write_all(response.as_bytes())
@@ -390,7 +446,7 @@ impl MediaServer {
         };
         let (start, end, status) = match range {
             Some((start, end)) => (start, end, "206 Partial Content"),
-            None => (0, entry.track.size - 1, "200 OK"),
+            None => (0, track.size - 1, "200 OK"),
         };
         let mut headers = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {}\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: private, no-store\r\nConnection: close\r\n",
@@ -400,7 +456,7 @@ impl MediaServer {
         if range.is_some() {
             headers.push_str(&format!(
                 "Content-Range: bytes {start}-{end}/{}\r\n",
-                entry.track.size
+                track.size
             ));
         }
         headers.push_str("\r\n");
@@ -411,7 +467,27 @@ impl MediaServer {
         if method == "HEAD" {
             return Ok(());
         }
-        stream_cached_audio(&mut socket, entry, start, end).await
+        if let Some(stream) = stream {
+            let mut offset = start;
+            while offset <= end {
+                let length = (end - offset + 1).min(MAX_STREAM_CHUNK_BYTES);
+                let bytes = stream.chunk(offset, length).await?;
+                tokio::time::timeout(Duration::from_secs(30), socket.write_all(&bytes))
+                    .await
+                    .map_err(|_| "Audio player stopped reading".to_string())?
+                    .map_err(|error| error.to_string())?;
+                offset += length;
+            }
+            Ok(())
+        } else {
+            stream_cached_audio(
+                &mut socket,
+                entry.ok_or("audio is not prepared")?,
+                start,
+                end,
+            )
+            .await
+        }
     }
 }
 
@@ -1272,9 +1348,53 @@ struct RemoteClient {
     connection: tokio::sync::RwLock<Option<iroh::endpoint::Connection>>,
     desktop: tokio::sync::RwLock<Option<SavedDesktop>>,
     start_lock: tokio::sync::Mutex<()>,
+    generation: Arc<AtomicU64>,
 }
 
 impl RemoteClient {
+    async fn stream_only(&self) -> bool {
+        self.desktop
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|desktop| desktop.stream_only)
+    }
+
+    async fn invalidate_playback(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(connection) = self.connection.write().await.take() {
+            connection.close(0u32.into(), b"pairing changed");
+        }
+    }
+
+    async fn prepare_stream(
+        self: &Arc<Self>,
+        track: RemoteTrack,
+        media: Arc<MediaServer>,
+    ) -> Result<CachedAudio, String> {
+        let generation = self.generation.load(Ordering::Acquire);
+        let entry = Arc::new(StreamingEntry {
+            track: track.clone(),
+            remote: self.clone(),
+            generation,
+            current_generation: self.generation.clone(),
+        });
+        // Check access and metadata before giving the player a URL. Never touch the disk cache.
+        entry.chunk(0, 1).await?;
+        let key = hex::encode(SecretKey::generate().to_bytes());
+        let url = format!(
+            "http://127.0.0.1:{}/{}/{}.{}",
+            media.port,
+            media.token,
+            key,
+            safe_extension(&track.format)?
+        );
+        let mut streams = media.streams.write().await;
+        streams.clear();
+        streams.insert(key, entry);
+        Ok(CachedAudio { url, track })
+    }
+
     fn new(app_data: PathBuf) -> Arc<Self> {
         let desktop = fs::read(app_data.join("paired-desktop.json"))
             .ok()
@@ -1285,6 +1405,7 @@ impl RemoteClient {
             connection: tokio::sync::RwLock::new(None),
             desktop: tokio::sync::RwLock::new(desktop),
             start_lock: tokio::sync::Mutex::new(()),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1337,6 +1458,7 @@ impl RemoteClient {
             endpoint_id: ticket.endpoint_id.clone(),
             endpoint_addr: ticket.endpoint_addr.clone(),
             desktop_name: ticket.desktop_name.clone(),
+            stream_only: false,
         };
         let endpoint = self.endpoint().await?;
         let address = decode_endpoint_addr(&desktop)?;
@@ -1352,26 +1474,32 @@ impl RemoteClient {
                 ClientRequest::Pair {
                     token: ticket.token,
                     device_name: clean_device_name(device_name),
+                    supports_streaming: true,
                 },
             ),
         )
         .await
         .map_err(|_| "Napstr did not complete pairing in time")??
         .0;
-        let desktop_name = match response {
-            ServerResponse::Paired { desktop_name } => desktop_name,
+        let (desktop_name, stream_only) = match response {
+            ServerResponse::Paired {
+                desktop_name,
+                stream_only,
+            } => (desktop_name, stream_only),
             other => return Err(unexpected_response(&other)),
         };
         let mut saved = desktop;
         saved.desktop_name = desktop_name.clone();
+        saved.stream_only = stream_only;
         save_json(&self.app_data.join("paired-desktop.json"), &saved)?;
+        self.invalidate_playback().await;
         *self.desktop.write().await = Some(saved);
         *self.connection.write().await = Some(connection);
         Ok(desktop_name)
     }
 
     async fn forget(&self) -> Result<(), String> {
-        *self.connection.write().await = None;
+        self.invalidate_playback().await;
         *self.desktop.write().await = None;
         match fs::remove_file(self.app_data.join("paired-desktop.json")) {
             Ok(()) => Ok(()),
@@ -1416,6 +1544,7 @@ impl RemoteClient {
         let desktop = self.desktop.read().await.clone();
         if desktop.is_none() {
             return CompanionStatus {
+                stream_only: false,
                 paired: false,
                 connected: false,
                 desktop_name: String::new(),
@@ -1429,6 +1558,7 @@ impl RemoteClient {
             .await
         {
             Err(_) => CompanionStatus {
+                stream_only: desktop.stream_only,
                 paired: true,
                 connected: false,
                 desktop_name: desktop.desktop_name,
@@ -1436,18 +1566,36 @@ impl RemoteClient {
                 library_revision: 0,
                 error: "Napstr did not answer yet".into(),
             },
-            Ok(Ok(ServerResponse::Status { library_revision })) => CompanionStatus {
-                paired: true,
-                connected: true,
-                desktop_name: desktop.desktop_name,
-                endpoint_id: desktop.endpoint_id,
+            Ok(Ok(ServerResponse::Status {
                 library_revision,
-                error: String::new(),
-            },
+                stream_only,
+            })) => {
+                if stream_only != desktop.stream_only {
+                    let mut saved = self.desktop.write().await;
+                    if let Some(saved) = saved
+                        .as_mut()
+                        .filter(|saved| saved.endpoint_id == desktop.endpoint_id)
+                    {
+                        saved.stream_only = stream_only;
+                        let _ = save_json(&self.app_data.join("paired-desktop.json"), saved);
+                    }
+                    self.generation.fetch_add(1, Ordering::AcqRel);
+                }
+                CompanionStatus {
+                    stream_only,
+                    paired: true,
+                    connected: true,
+                    desktop_name: desktop.desktop_name,
+                    endpoint_id: desktop.endpoint_id,
+                    library_revision,
+                    error: String::new(),
+                }
+            }
             Ok(Err(error)) if error == "invalid Napstrfy request" => {
                 self.legacy_status(desktop).await
             }
             Ok(Ok(other)) => CompanionStatus {
+                stream_only: desktop.stream_only,
                 paired: true,
                 connected: false,
                 desktop_name: desktop.desktop_name,
@@ -1456,6 +1604,7 @@ impl RemoteClient {
                 error: unexpected_response(&other),
             },
             Ok(Err(error)) => CompanionStatus {
+                stream_only: desktop.stream_only,
                 paired: true,
                 connected: false,
                 desktop_name: desktop.desktop_name,
@@ -1470,6 +1619,7 @@ impl RemoteClient {
         match tokio::time::timeout(Duration::from_secs(8), self.request(ClientRequest::Ping)).await
         {
             Ok(Ok(ServerResponse::Pong)) => CompanionStatus {
+                stream_only: desktop.stream_only,
                 paired: true,
                 connected: true,
                 desktop_name: desktop.desktop_name,
@@ -1478,6 +1628,7 @@ impl RemoteClient {
                 error: String::new(),
             },
             Ok(Ok(other)) => CompanionStatus {
+                stream_only: desktop.stream_only,
                 paired: true,
                 connected: false,
                 desktop_name: desktop.desktop_name,
@@ -1486,6 +1637,7 @@ impl RemoteClient {
                 error: unexpected_response(&other),
             },
             Ok(Err(error)) => CompanionStatus {
+                stream_only: desktop.stream_only,
                 paired: true,
                 connected: false,
                 desktop_name: desktop.desktop_name,
@@ -1494,6 +1646,7 @@ impl RemoteClient {
                 error,
             },
             Err(_) => CompanionStatus {
+                stream_only: desktop.stream_only,
                 paired: true,
                 connected: false,
                 desktop_name: desktop.desktop_name,
@@ -1505,12 +1658,15 @@ impl RemoteClient {
     }
 
     async fn cache_audio(
-        &self,
+        self: &Arc<Self>,
         requested_track: RemoteTrack,
         media: Arc<MediaServer>,
         library_visible: bool,
     ) -> Result<CachedAudio, String> {
         validate_cache_track(&requested_track)?;
+        if self.stream_only().await {
+            return self.prepare_stream(requested_track, media).await;
+        }
         let _guard = media.prepare_lock.lock().await;
         if let Some(entry) = media.entry(&requested_track.file_id).await {
             if entry.failure().is_none() {
@@ -1624,6 +1780,9 @@ impl RemoteClient {
     }
 
     async fn cached_entries(&self) -> Result<Vec<CachedRemoteAudio>, String> {
+        if self.stream_only().await {
+            return Ok(Vec::new());
+        }
         let app_data = self.app_data.clone();
         tokio::task::spawn_blocking(move || cached_entries_in(&app_data))
             .await
@@ -1639,6 +1798,7 @@ impl RemoteClient {
             .map(|item| item.track)
             .collect::<Vec<_>>();
         Ok(OfflineLibrary {
+            stream_only: desktop.as_ref().is_some_and(|desktop| desktop.stream_only),
             total: tracks.len(),
             tracks,
             paired: desktop.is_some(),
@@ -1993,6 +2153,9 @@ async fn prefetch_remote_audio(
     library_visible: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    if state.remote.stream_only().await {
+        return Ok(());
+    }
     validate_file_id(&after_file_id)?;
     validate_cache_track(&track)?;
     let key = (after_file_id.clone(), track.file_id.clone());
@@ -2305,6 +2468,163 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_only_playback_seeks_without_using_the_disk_cache() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let root = std::env::temp_dir().join(format!(
+                    "napstrfy-stream-{}",
+                    hex::encode(SecretKey::generate().to_bytes())
+                ));
+                fs::create_dir_all(&root).unwrap();
+                // Any attempt to create/read audio cache files here would fail.
+                fs::write(root.join("audio"), b"not a cache directory").unwrap();
+                let bytes: Vec<u8> = (0..MAX_STREAM_CHUNK_BYTES as usize + 512)
+                    .map(|index| (index % 251) as u8)
+                    .collect();
+                let track = RemoteTrack {
+                    file_id: hex::encode(Sha256::digest(&bytes)),
+                    filename: "song.mp3".into(),
+                    title: "Song".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    format: "MP3".into(),
+                    mime: "audio/mpeg".into(),
+                    size: bytes.len() as u64,
+                    tags: String::new(),
+                    local: true,
+                    sources: Vec::new(),
+                };
+                let desktop_endpoint = Endpoint::builder(presets::Minimal)
+                    .clear_ip_transports()
+                    .alpns(vec![ALPN.to_vec()])
+                    .bind_addr("127.0.0.1:0")
+                    .unwrap()
+                    .bind()
+                    .await
+                    .unwrap();
+                let phone_endpoint = Endpoint::builder(presets::Minimal)
+                    .clear_ip_transports()
+                    .bind_addr("127.0.0.1:0")
+                    .unwrap()
+                    .bind()
+                    .await
+                    .unwrap();
+                let revoked = Arc::new(AtomicBool::new(false));
+                let server_revoked = revoked.clone();
+                let server_track = track.clone();
+                let server_bytes = bytes.clone();
+                let endpoint = desktop_endpoint.clone();
+                let server = tokio::spawn(async move {
+                    let connection = endpoint.accept().await.unwrap().await.unwrap();
+                    while let Ok((mut send, mut receive)) = connection.accept_bi().await {
+                        let mut length = [0; 4];
+                        receive.read_exact(&mut length).await.unwrap();
+                        let mut payload = vec![0; u32::from_be_bytes(length) as usize];
+                        receive.read_exact(&mut payload).await.unwrap();
+                        let request: ClientRequest = serde_json::from_slice(&payload).unwrap();
+                        let ClientRequest::StreamAudio {
+                            file_id,
+                            offset,
+                            length,
+                        } = request
+                        else {
+                            panic!("stream-only playback requested a download: {request:?}");
+                        };
+                        assert_eq!(file_id, server_track.file_id);
+                        assert!(length > 0 && length <= MAX_STREAM_CHUNK_BYTES);
+                        let response = if server_revoked.load(Ordering::Acquire) {
+                            ServerResponse::Error {
+                                message: "This phone is not paired with Napstr".into(),
+                            }
+                        } else {
+                            ServerResponse::AudioReady {
+                                track: server_track.clone(),
+                            }
+                        };
+                        let payload = serde_json::to_vec(&response).unwrap();
+                        send.write_all(&(payload.len() as u32).to_be_bytes())
+                            .await
+                            .unwrap();
+                        send.write_all(&payload).await.unwrap();
+                        if matches!(response, ServerResponse::AudioReady { .. }) {
+                            send.write_all(
+                                &server_bytes[offset as usize..(offset + length) as usize],
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        send.finish().unwrap();
+                    }
+                });
+                let connection = phone_endpoint
+                    .connect(desktop_endpoint.addr(), ALPN)
+                    .await
+                    .unwrap();
+                let remote = RemoteClient::new(root.clone());
+                *remote.desktop.write().await = Some(SavedDesktop {
+                    endpoint_id: desktop_endpoint.id().to_string(),
+                    endpoint_addr: String::new(),
+                    desktop_name: "Test Napstr".into(),
+                    stream_only: true,
+                });
+                *remote.connection.write().await = Some(connection);
+                let media = MediaServer::start().unwrap();
+                let playback = remote
+                    .cache_audio(track.clone(), media.clone(), true)
+                    .await
+                    .unwrap();
+                let http = reqwest::Client::builder().no_proxy().build().unwrap();
+                let response = http
+                    .get(&playback.url)
+                    .header("Range", "bytes=123-456")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 206);
+                assert_eq!(
+                    response.headers()["content-range"],
+                    format!("bytes 123-456/{}", bytes.len())
+                );
+                assert_eq!(response.headers()["cache-control"], "private, no-store");
+                assert_eq!(&response.bytes().await.unwrap()[..], &bytes[123..457]);
+                let response = http.get(&playback.url).send().await.unwrap();
+                assert_eq!(response.status(), 200);
+                assert_eq!(&response.bytes().await.unwrap()[..], bytes.as_slice());
+                let response = http
+                    .get(&playback.url)
+                    .header("Range", "bytes=999999999-")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 416);
+                assert!(remote.offline_library().await.unwrap().tracks.is_empty());
+                assert!(media.entries.read().await.is_empty());
+                assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+                let stream = media.streams.read().await.values().next().unwrap().clone();
+                revoked.store(true, Ordering::Release);
+                assert!(stream.chunk(0, 1).await.unwrap_err().contains("not paired"));
+                revoked.store(false, Ordering::Release);
+                remote.invalidate_playback().await;
+                assert!(stream
+                    .chunk(0, 1)
+                    .await
+                    .unwrap_err()
+                    .contains("pairing changed"));
+                tokio::time::timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                phone_endpoint.close().await;
+                desktop_endpoint.close().await;
+                fs::remove_dir_all(root).unwrap();
+            });
+    }
 
     #[test]
     fn only_hashes_and_known_audio_extensions_become_cache_paths() {

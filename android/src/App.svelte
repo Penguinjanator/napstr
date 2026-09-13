@@ -24,7 +24,7 @@
     { value: 'once', icon: '▶1', label: 'Play once' }
   ];
   let activeTab = $state<AppTab>('music');
-  let status = $state<CompanionStatus>({ paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' });
+  let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' });
   let statusLoading = $state(true);
   let statusPending = $state(false);
   let pairingCode = $state('');
@@ -240,9 +240,9 @@
 
   async function loadCachedLibrary() {
     try {
-      const offline = await invoke<LibraryPage & { paired: boolean; desktopName: string }>('cached_library');
+      const offline = await invoke<LibraryPage & { paired: boolean; desktopName: string; streamOnly: boolean }>('cached_library');
       if (offline.paired) {
-        status = { ...status, paired: true, desktopName: offline.desktopName };
+        status = { ...status, paired: true, desktopName: offline.desktopName, streamOnly: offline.streamOnly };
       }
       tracks = offline.tracks;
       total = offline.total;
@@ -341,7 +341,7 @@
   async function forgetDesktop() {
     if (!window.confirm('Disconnect this phone from Napstr? You will need to scan a new QR code.')) return;
     await invoke('forget_desktop');
-    status = { paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' };
+    status = { streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' };
     tracks = [];
     current = null;
     audio?.pause();
@@ -502,7 +502,7 @@
           ? (playerIndex + 1) % playerQueue.length
           : -1;
       const next = nextIndex >= 0 ? playerQueue[nextIndex] : undefined;
-      if (next?.local) {
+      if (next?.local && !status.streamOnly) {
         void invoke('prefetch_remote_audio', {
           afterFileId: cached.track.fileId,
           track: next,
@@ -530,6 +530,10 @@
     destinationFolder: string | null = null,
     audiobookId: string | null = null
   ) {
+    if (status.streamOnly) {
+      error = 'This pairing allows streaming only. Downloads are disabled.';
+      return;
+    }
     if (pending.has(track.fileId)) return;
     pending = new Map(pending).set(track.fileId, track.filename);
     if (audiobookId) pendingAudiobooks = new Map(pendingAudiobooks).set(track.fileId, audiobookId);
@@ -554,7 +558,7 @@
   }
 
   async function refreshTransfers() {
-    if (!status.connected || pending.size === 0) return;
+    if (!status.connected || status.streamOnly || pending.size === 0) return;
     try {
       transfers = await invoke<RemoteTransfer[]>('remote_transfers');
       for (const fileId of [...pending]) {
@@ -1041,7 +1045,7 @@
     <header class="mobile-header">
       <div class="brand"><img src="/napstr-logo-small.png" alt="" /><b>napstrfy</b></div>
       {#if status.paired}
-        <button class="desktop-status" class:offline={!status.connected} onclick={reconnect}><i></i><span>{statusPending ? 'Connecting…' : status.connected ? status.desktopName || 'Napstr connected' : 'Reconnect'}</span></button>
+        <button class="desktop-status" class:offline={!status.connected} onclick={reconnect}><i></i><span>{statusPending ? 'Connecting…' : status.connected ? status.desktopName || 'Napstr connected' : 'Reconnect'}{status.streamOnly ? ' · Stream only' : ''}</span></button>
       {:else}
         <button class="desktop-status offline" onclick={() => (activeTab = 'music')}><i></i><span>Pair Napstr for music</span></button>
       {/if}
@@ -1053,7 +1057,7 @@
     {#if activeTab === 'music'}
       <section class="search-area">
         <form onsubmit={(event) => { event.preventDefault(); void searchTracks(); }}>
-          <span>⌕</span><input bind:value={query} placeholder="Search your music and Nostr" aria-label="Search tracks" />
+          <span>⌕</span><input bind:value={query} placeholder={status.streamOnly ? "Search Napstr’s music" : "Search your music and Nostr"} aria-label="Search tracks" />
           {#if query}<button type="button" class="clear-search" onclick={() => searchTracks('')}>×</button>{/if}
         </form>
         <div class="chips"><button class:active={showingLikedMusic} onclick={showLikedTracks}>♥ Liked</button>{#each musicChips as chip}<button class:active={!showingLikedMusic && query.toLocaleLowerCase() === chip.toLocaleLowerCase()} onclick={() => selectChip(chip)}>{chip}</button>{/each}</div>
@@ -1069,11 +1073,11 @@
         {#if !loading && tracks.length === 0}<div class="empty-library"><img src="/napstr-logo-small.png" alt="" /><h2>{showingLikedMusic ? 'No liked tracks yet' : 'No tracks found'}</h2><p>{showingLikedMusic ? 'Tap the heart beside a song to keep it here.' : query ? 'Try different words or clear the search.' : 'Add music to your Napstr folder on the computer.'}</p></div>{/if}
         {#each tracks as track, index (track.fileId)}
           <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class="track-row">
-            <button class="track-open" onclick={() => activateTrack(track)}>
+            <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
               <TrackArtwork {track} lookup={index < 24} />
               <span class="track-copy"><strong>{title(track)}</strong><small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small></span>
               <span class="track-meta">{track.local ? readableSize(track.size) : `${track.sources.length} ${track.sources.length === 1 ? 'seeder' : 'seeders'}`}</span>
-              <span class="track-action">{pending.has(track.fileId) ? '···' : track.local ? '⋮' : '⇩'}</span>
+              <span class="track-action">{pending.has(track.fileId) ? '···' : track.local ? '⋮' : status.streamOnly ? 'Unavailable' : '⇩'}</span>
             </button>
             <button class:liked={isTrackLiked(track)} class="like-button" onclick={() => toggleTrackLike(track)} aria-label={`${isTrackLiked(track) ? 'Unlike' : 'Like'} ${title(track)}`}>{isTrackLiked(track) ? '♥' : '♡'}</button>
           </div>
@@ -1155,8 +1159,8 @@
         </section>
         <section class="audiobook-chapter-list" aria-busy={audiobookLoading}>
           {#each selectedAudiobook.chapters as chapter, index (chapter.fileId)}
-            <button class="audiobook-chapter" onclick={() => activateAudiobookChapter(selectedAudiobook!, chapter)}>
-              <span>{chapter.local ? '▶' : '⇩'}</span>
+            <button class="audiobook-chapter" disabled={status.streamOnly && !chapter.local} onclick={() => activateAudiobookChapter(selectedAudiobook!, chapter)}>
+              <span>{chapter.local ? '▶' : status.streamOnly ? '—' : '⇩'}</span>
               <span><strong>{chapter.title || chapter.filename}</strong><small>Chapter {index + 1} · {readableSize(chapter.size)}</small></span>
             </button>
           {/each}

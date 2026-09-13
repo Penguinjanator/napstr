@@ -146,6 +146,8 @@ input:focus, select:focus { outline: 1px dotted #333; outline-offset: -4px; }
 .file-table tbody tr:hover { background: #d8e6ea; }
 .file-table tbody tr.selected { color: white; background: var(--navy); }
 .file-table tbody tr.selected td { border-bottom-color: var(--navy); }
+.search-results-table tbody { user-select: none; }
+.search-results-table tbody tr:focus-visible { outline: 1px dotted currentColor; outline-offset: -2px; }
 .file-table .name-col { width: 48%; }.file-table th:nth-child(2) { width: 65px; }.file-table th:nth-child(3) { width: 78px; }.file-table th:nth-child(4) { width: 70px; }.file-table th:nth-child(5) { width: 82px; }.file-table th:nth-child(6) { width: 62px; }
 .number { text-align: right !important; }.file-icon { display: inline-grid; place-items: center; width: 16px; height: 16px; margin-right: 4px; color: #323285; border: 1px solid #999; background: white; font-size: 8px; vertical-align: middle; }
 .file-icon.audiobook-icon { color: #6a3b00; background: #fff7cf; font-size: 12px; }
@@ -315,3 +317,5 @@ body.resizing-transfer-pane, body.resizing-transfer-pane * { cursor: ns-resize !
   .selected-file { padding-top: 5px; padding-bottom: 5px; }
   .details-pane fieldset { margin-top: 4px; margin-bottom: 4px; }
 }
+
+.mobile-connect-grid > .paired-devices-card { grid-column: 1 / -1; }

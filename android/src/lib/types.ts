@@ -33,6 +33,7 @@ export type AudiobookLibraryPage = {
 };
 
 export type CompanionStatus = {
+  streamOnly: boolean;
   paired: boolean;
   connected: boolean;
   desktopName: string;

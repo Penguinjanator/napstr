@@ -2005,9 +2005,10 @@ async fn mobile_status(state: State<'_, AppState>) -> Result<mobile::MobileStatu
 
 #[tauri::command]
 async fn create_mobile_pairing(
+    stream_only: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<mobile::MobilePairingOffer, String> {
-    state.mobile.create_pairing().await
+    state.mobile.create_pairing(stream_only.unwrap_or(false)).await
 }
 
 #[tauri::command]

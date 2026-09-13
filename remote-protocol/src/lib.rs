@@ -5,6 +5,7 @@ pub const ALPN: &[u8] = b"/napstr/mobile/1";
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_PAGE_SIZE: usize = 200;
+pub const MAX_STREAM_CHUNK_BYTES: u64 = 1024 * 1024;
 const PAIRING_URI_PREFIX: &str = "napstrfy://pair/";
 const LEGACY_PAIRING_URI_PREFIX: &str = "nostrfy://pair/";
 
@@ -116,6 +117,8 @@ pub enum ClientRequest {
     Pair {
         token: String,
         device_name: String,
+        #[serde(default)]
+        supports_streaming: bool,
     },
     Library {
         query: String,
@@ -146,6 +149,11 @@ pub enum ClientRequest {
     FetchAudio {
         file_id: String,
     },
+    StreamAudio {
+        file_id: String,
+        offset: u64,
+        length: u64,
+    },
     Available {
         file_ids: Vec<String>,
     },
@@ -162,6 +170,8 @@ pub enum ClientRequest {
 pub enum ServerResponse {
     Paired {
         desktop_name: String,
+        #[serde(default)]
+        stream_only: bool,
     },
     Library {
         tracks: Vec<RemoteTrack>,
@@ -194,6 +204,8 @@ pub enum ServerResponse {
     },
     Status {
         library_revision: u64,
+        #[serde(default)]
+        stream_only: bool,
     },
     Pong,
     Error {
@@ -204,6 +216,39 @@ pub enum ServerResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_pairing_and_status_messages_keep_full_access() {
+        assert_eq!(
+            serde_json::from_str::<ServerResponse>(
+                r#"{"type":"paired","desktopName":"Old Napstr"}"#
+            )
+            .unwrap(),
+            ServerResponse::Paired {
+                desktop_name: "Old Napstr".into(),
+                stream_only: false
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ServerResponse>(r#"{"type":"status","libraryRevision":1}"#)
+                .unwrap(),
+            ServerResponse::Status {
+                library_revision: 1,
+                stream_only: false
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientRequest>(
+                r#"{"type":"pair","token":"secret","deviceName":"Old phone"}"#
+            )
+            .unwrap(),
+            ClientRequest::Pair {
+                token: "secret".into(),
+                device_name: "Old phone".into(),
+                supports_streaming: false
+            }
+        );
+    }
 
     #[test]
     fn pairing_ticket_round_trips_without_exposing_raw_json() {
@@ -225,6 +270,7 @@ mod tests {
     fn library_status_round_trips() {
         let response = ServerResponse::Status {
             library_revision: 42,
+            stream_only: true,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert_eq!(

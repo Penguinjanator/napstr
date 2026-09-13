@@ -7,7 +7,7 @@ use iroh::{endpoint::presets, Endpoint, SecretKey};
 use napstr_remote_protocol::{
     ClientRequest, PairingTicket, RemoteAudiobook, RemoteAudiobookSummary, RemoteSource,
     RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_PAGE_SIZE,
-    PROTOCOL_VERSION,
+    MAX_STREAM_CHUNK_BYTES, PROTOCOL_VERSION,
 };
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 const PAIRING_LIFETIME_SECONDS: i64 = 5 * 60;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -31,6 +31,7 @@ pub struct PairedDevice {
     name: String,
     paired_at: String,
     last_seen: String,
+    stream_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +56,7 @@ pub struct MobilePairingOffer {
 struct PairingSession {
     token: String,
     expires_at: i64,
+    stream_only: bool,
 }
 
 #[derive(Default)]
@@ -77,7 +79,7 @@ pub struct MobileService {
     network: Arc<crate::network::NetworkService>,
     endpoint: tokio::sync::RwLock<Option<Endpoint>>,
     start_lock: tokio::sync::Mutex<()>,
-    pairing: Mutex<Option<PairingSession>>,
+    pairing: Mutex<Vec<PairingSession>>,
     status: Mutex<RuntimeStatus>,
     audiobook_cache: Mutex<std::collections::HashMap<String, RemoteAudiobook>>,
     music_library_cache: Mutex<Option<MusicLibraryCache>>,
@@ -99,7 +101,7 @@ impl MobileService {
             network,
             endpoint: tokio::sync::RwLock::new(None),
             start_lock: tokio::sync::Mutex::new(()),
-            pairing: Mutex::new(None),
+            pairing: Mutex::new(Vec::new()),
             status: Mutex::new(RuntimeStatus::default()),
             audiobook_cache: Mutex::new(std::collections::HashMap::new()),
             music_library_cache: Mutex::new(None),
@@ -204,7 +206,10 @@ impl MobileService {
         }
     }
 
-    pub async fn create_pairing(self: &Arc<Self>) -> Result<MobilePairingOffer, String> {
+    pub async fn create_pairing(
+        self: &Arc<Self>,
+        stream_only: bool,
+    ) -> Result<MobilePairingOffer, String> {
         self.start().await?;
         let endpoint = self
             .endpoint
@@ -219,13 +224,20 @@ impl MobileService {
             .map_err(|error| format!("could not encode the Iroh address: {error}"))?;
         let token = hex::encode(rand::random::<[u8; 32]>());
         let expires_at = Utc::now().timestamp() + PAIRING_LIFETIME_SECONDS;
-        *self
-            .pairing
-            .lock()
-            .map_err(|_| "pairing state lock was poisoned")? = Some(PairingSession {
-            token: token.clone(),
-            expires_at,
-        });
+        {
+            let mut pairing = self
+                .pairing
+                .lock()
+                .map_err(|_| "pairing state lock was poisoned")?;
+            pairing.retain(|session| {
+                session.stream_only != stream_only && session.expires_at >= Utc::now().timestamp()
+            });
+            pairing.push(PairingSession {
+                token: token.clone(),
+                expires_at,
+                stream_only,
+            });
+        }
         let desktop_name = open_connection(&self.db_path)
             .and_then(|connection| crate::get_setting(&connection, "display_name"))
             .unwrap_or_else(|_| "Napstr".into());
@@ -353,19 +365,18 @@ impl MobileService {
         self.pairing
             .lock()
             .ok()
-            .and_then(|mut pairing| {
-                if pairing
-                    .as_ref()
-                    .is_some_and(|session| session.expires_at < now)
-                {
-                    *pairing = None;
-                }
-                pairing.as_ref().map(|_| true)
+            .map(|mut pairing| {
+                pairing.retain(|session| session.expires_at >= now);
+                !pairing.is_empty()
             })
             .unwrap_or(false)
     }
 
-    async fn audiobook_catalogue(&self, query: &str) -> Result<Vec<RemoteAudiobook>, String> {
+    async fn audiobook_catalogue(
+        &self,
+        query: &str,
+        stream_only: bool,
+    ) -> Result<Vec<RemoteAudiobook>, String> {
         let (local_books, local_tracks) = load_local_remote_audiobooks(&self.db_path)?;
         let mut books = std::collections::HashMap::new();
         for book in local_books.into_iter().filter(|book| {
@@ -385,7 +396,12 @@ impl MobileService {
         }) {
             books.insert(book.audiobook_id.clone(), book);
         }
-        for book in self.network.search_audiobooks(query).await? {
+        let remote = if stream_only {
+            Vec::new()
+        } else {
+            self.network.search_audiobooks(query).await?
+        };
+        for book in remote {
             books
                 .entry(book.audiobook_id.clone())
                 .or_insert_with(|| remote_audiobook(book, &local_tracks));
@@ -451,11 +467,18 @@ impl MobileService {
         request: ClientRequest,
         send: &mut iroh::endpoint::SendStream,
     ) -> Result<(), String> {
-        if let ClientRequest::Pair { token, device_name } = request {
-            self.accept_pairing(remote_id, &token, &device_name)?;
+        if let ClientRequest::Pair {
+            token,
+            device_name,
+            supports_streaming,
+        } = request
+        {
+            let stream_only =
+                self.accept_pairing(remote_id, &token, &device_name, supports_streaming)?;
             return write_response(
                 send,
                 &ServerResponse::Paired {
+                    stream_only,
                     desktop_name: open_connection(&self.db_path)
                         .and_then(|connection| crate::get_setting(&connection, "display_name"))
                         .unwrap_or_else(|_| "Napstr".into()),
@@ -463,7 +486,8 @@ impl MobileService {
             )
             .await;
         }
-        self.authorise(remote_id)?;
+        let stream_only = self.authorise(remote_id)?;
+        check_request_permission(stream_only, &request)?;
         self.touch_device(remote_id);
         match request {
             ClientRequest::Library {
@@ -485,7 +509,11 @@ impl MobileService {
                 }
                 let (mut tracks, _, audiobook_chapter_ids) =
                     self.music_library(query, 0, MAX_PAGE_SIZE)?;
-                let remote = self.network.search(query).await?;
+                let remote = if stream_only {
+                    Vec::new()
+                } else {
+                    self.network.search(query).await?
+                };
                 for result in remote {
                     if audiobook_chapter_ids.contains(&result.file_id)
                         || tracks.iter().any(|track| track.file_id == result.file_id)
@@ -529,7 +557,7 @@ impl MobileService {
                     return Err("Audiobook searches are limited to 120 characters".into());
                 }
                 // Legacy full response retained for older Napstrfy installs.
-                let audiobooks = self.audiobook_catalogue(query).await?;
+                let audiobooks = self.audiobook_catalogue(query, stream_only).await?;
                 write_response(send, &ServerResponse::Audiobooks { audiobooks }).await
             }
             ClientRequest::AudiobookLibrary {
@@ -541,7 +569,7 @@ impl MobileService {
                 if query.chars().count() > 120 {
                     return Err("Audiobook searches are limited to 120 characters".into());
                 }
-                let audiobooks = self.audiobook_catalogue(query).await?;
+                let audiobooks = self.audiobook_catalogue(query, stream_only).await?;
                 let total = audiobooks.len();
                 let summaries = audiobooks
                     .into_iter()
@@ -579,6 +607,9 @@ impl MobileService {
                         cache.insert(audiobook_id, audiobook.clone());
                     }
                     return write_response(send, &ServerResponse::Audiobook { audiobook }).await;
+                }
+                if stream_only {
+                    return Err("This audiobook is not in Napstr's local library".into());
                 }
                 let mut audiobook = self
                     .audiobook_cache
@@ -648,6 +679,12 @@ impl MobileService {
                     .map_err(|error| format!("could not open the audio: {error}"))?;
                 let mut buffer = vec![0u8; 256 * 1024];
                 loop {
+                    check_request_permission(
+                        self.authorise(remote_id)?,
+                        &ClientRequest::FetchAudio {
+                            file_id: file_id.clone(),
+                        },
+                    )?;
                     let count = file
                         .read(&mut buffer)
                         .await
@@ -660,6 +697,35 @@ impl MobileService {
                         .map_err(|error| format!("Iroh audio stream failed: {error}"))?;
                 }
                 Ok(())
+            }
+            ClientRequest::StreamAudio {
+                file_id,
+                offset,
+                length,
+            } => {
+                let track = local_track(&self.db_path, &file_id)?;
+                validate_stream_range(track.size, offset, length)?;
+                let path = secure_audio_path(&self.db_path, &file_id)?;
+                let mut file = tokio::fs::File::open(path)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                file.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                // A bounded in-memory chunk; each subsequent range is authorised again.
+                let mut bytes = vec![0; length as usize];
+                file.read_exact(&mut bytes)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                self.authorise(remote_id)?;
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    write_response(send, &ServerResponse::AudioReady { track }).await?;
+                    send.write_all(&bytes)
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|_| "Audio player stopped reading".to_string())?
             }
             ClientRequest::Available { file_ids } => {
                 if file_ids.len() > MAX_PAGE_SIZE
@@ -684,6 +750,7 @@ impl MobileService {
                     send,
                     &ServerResponse::Status {
                         library_revision: library_revision(&self.db_path)?,
+                        stream_only,
                     },
                 )
                 .await
@@ -693,52 +760,29 @@ impl MobileService {
         }
     }
 
-    fn accept_pairing(&self, remote_id: &str, token: &str, name: &str) -> Result<(), String> {
-        let now = Utc::now();
+    fn accept_pairing(
+        &self,
+        remote_id: &str,
+        token: &str,
+        name: &str,
+        supports_streaming: bool,
+    ) -> Result<bool, String> {
         let mut pairing = self
             .pairing
             .lock()
             .map_err(|_| "pairing state lock was poisoned")?;
-        let current = pairing
-            .as_ref()
-            .ok_or("No pairing request is open on Napstr")?;
-        if current.expires_at < now.timestamp() {
-            *pairing = None;
-            return Err("The pairing code has expired".into());
-        }
-        if current.token.as_bytes() != token.as_bytes() {
-            return Err("The pairing code is not valid".into());
-        }
-        let endpoint = remote_id
-            .parse::<iroh::EndpointId>()
-            .map_err(|_| "invalid mobile Iroh identity")?;
-        let name = clean_device_name(name);
-        let connection = open_connection(&self.db_path)?;
-        connection
-            .execute(
-                "INSERT INTO mobile_devices(endpoint_id,name,paired_at,last_seen)
-                 VALUES(?1,?2,?3,?3)
-                 ON CONFLICT(endpoint_id) DO UPDATE SET name=excluded.name,last_seen=excluded.last_seen",
-                params![endpoint.to_string(), name, now.to_rfc3339()],
-            )
-            .map_err(|error| error.to_string())?;
-        *pairing = None;
-        Ok(())
+        accept_pairing(
+            &self.db_path,
+            &mut pairing,
+            remote_id,
+            token,
+            name,
+            supports_streaming,
+        )
     }
 
-    fn authorise(&self, remote_id: &str) -> Result<(), String> {
-        let allowed: bool = open_connection(&self.db_path)?
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM mobile_devices WHERE endpoint_id=?1)",
-                [remote_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        if allowed {
-            Ok(())
-        } else {
-            Err("This phone is not paired with Napstr".into())
-        }
+    fn authorise(&self, remote_id: &str) -> Result<bool, String> {
+        device_stream_only(&self.db_path, remote_id)
     }
 
     fn touch_device(&self, remote_id: &str) {
@@ -759,6 +803,77 @@ impl MobileService {
             );
         }
     }
+}
+
+fn accept_pairing(
+    db_path: &Path,
+    pairing: &mut Vec<PairingSession>,
+    remote_id: &str,
+    token: &str,
+    name: &str,
+    supports_streaming: bool,
+) -> Result<bool, String> {
+    let now = Utc::now();
+    pairing.retain(|session| session.expires_at >= now.timestamp());
+    let index = pairing
+        .iter()
+        .position(|session| session.token.as_bytes() == token.as_bytes())
+        .ok_or("The pairing code is invalid or expired")?;
+    let stream_only = pairing[index].stream_only;
+    if stream_only && !supports_streaming {
+        return Err("Update Napstrfy to use a stream-only pairing code".into());
+    }
+    let endpoint = remote_id
+        .parse::<iroh::EndpointId>()
+        .map_err(|_| "invalid mobile Iroh identity")?;
+    let name = clean_device_name(name);
+    let connection = open_connection(db_path)?;
+    connection
+            .execute(
+                "INSERT INTO mobile_devices(endpoint_id,name,paired_at,last_seen,stream_only)
+                 VALUES(?1,?2,?3,?3,?4)
+                 ON CONFLICT(endpoint_id) DO UPDATE SET name=excluded.name,last_seen=excluded.last_seen,stream_only=excluded.stream_only",
+                params![endpoint.to_string(), name, now.to_rfc3339(), stream_only],
+            )
+            .map_err(|error| error.to_string())?;
+    pairing.remove(index);
+    Ok(stream_only)
+}
+fn device_stream_only(db_path: &Path, remote_id: &str) -> Result<bool, String> {
+    open_connection(db_path)?
+        .query_row(
+            "SELECT stream_only FROM mobile_devices WHERE endpoint_id=?1",
+            [remote_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "This phone is not paired with Napstr".into())
+}
+
+fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Result<(), String> {
+    if !stream_only {
+        return Ok(());
+    }
+    match request {
+        ClientRequest::Library { .. }
+        | ClientRequest::Search { .. }
+        | ClientRequest::Audiobooks { .. }
+        | ClientRequest::AudiobookLibrary { .. }
+        | ClientRequest::Audiobook { .. }
+        | ClientRequest::StreamAudio { .. }
+        | ClientRequest::Available { .. }
+        | ClientRequest::Status
+        | ClientRequest::Ping => Ok(()),
+        _ => Err("This phone has stream-only access. Downloads are not permitted.".into()),
+    }
+}
+
+fn validate_stream_range(size: u64, offset: u64, length: u64) -> Result<(), String> {
+    if length == 0 || length > MAX_STREAM_CHUNK_BYTES || offset >= size || length > size - offset {
+        return Err("Invalid audio streaming range".into());
+    }
+    Ok(())
 }
 
 fn is_sha256_file_id(value: &str) -> bool {
@@ -846,7 +961,8 @@ fn load_local_remote_audiobooks(
 }
 
 fn initialise_schema(db_path: &Path) -> Result<(), String> {
-    open_connection(db_path)?
+    let connection = open_connection(db_path)?;
+    connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS mobile_devices (
                endpoint_id TEXT PRIMARY KEY,
@@ -855,14 +971,23 @@ fn initialise_schema(db_path: &Path) -> Result<(), String> {
                last_seen TEXT NOT NULL
              );",
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let has_permission: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mobile_devices') WHERE name='stream_only')",
+        [], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if !has_permission {
+        connection.execute_batch("ALTER TABLE mobile_devices ADD COLUMN stream_only INTEGER NOT NULL DEFAULT 0 CHECK(stream_only IN (0,1));")
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn load_devices(db_path: &Path) -> Result<Vec<PairedDevice>, String> {
     let connection = open_connection(db_path)?;
     let mut statement = connection
         .prepare(
-            "SELECT endpoint_id,name,paired_at,last_seen FROM mobile_devices ORDER BY last_seen DESC",
+            "SELECT endpoint_id,name,paired_at,last_seen,stream_only FROM mobile_devices ORDER BY last_seen DESC",
         )
         .map_err(|error| error.to_string())?;
     let devices = statement
@@ -872,6 +997,7 @@ fn load_devices(db_path: &Path) -> Result<Vec<PairedDevice>, String> {
                 name: row.get(1)?,
                 paired_at: row.get(2)?,
                 last_seen: row.get(3)?,
+                stream_only: row.get(4)?,
             })
         })
         .map_err(|error| error.to_string())?
@@ -1129,6 +1255,123 @@ async fn write_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_only_requests_cannot_download_or_inspect_transfers() {
+        for request in [
+            ClientRequest::RequestDownload {
+                file_id: "a".repeat(64),
+                source_pubkeys: vec![],
+                destination_folder: None,
+            },
+            ClientRequest::FetchAudio {
+                file_id: "a".repeat(64),
+            },
+            ClientRequest::Transfers,
+        ] {
+            assert!(check_request_permission(true, &request).is_err());
+            assert!(check_request_permission(false, &request).is_ok());
+        }
+        assert!(check_request_permission(
+            true,
+            &ClientRequest::StreamAudio {
+                file_id: "a".repeat(64),
+                offset: 1,
+                length: 32
+            }
+        )
+        .is_ok());
+        assert!(check_request_permission(
+            true,
+            &ClientRequest::Library {
+                query: String::new(),
+                offset: 0,
+                limit: 100
+            }
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn streaming_ranges_are_bounded_and_cannot_overflow() {
+        assert!(validate_stream_range(100, 99, 1).is_ok());
+        assert!(validate_stream_range(MAX_STREAM_CHUNK_BYTES, 0, MAX_STREAM_CHUNK_BYTES).is_ok());
+        for (size, offset, length) in [
+            (0, 0, 1),
+            (100, 0, 0),
+            (100, 100, 1),
+            (100, 99, 2),
+            (u64::MAX, u64::MAX - 1, 2),
+            (u64::MAX, 0, MAX_STREAM_CHUNK_BYTES + 1),
+        ] {
+            assert!(validate_stream_range(size, offset, length).is_err());
+        }
+    }
+
+    #[test]
+    fn pairing_grants_are_separate_single_use_and_persisted() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-pairing-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let db = directory.join("napstr.sqlite3");
+        let connection = open_connection(&db).unwrap();
+        // An existing installation must retain its previous full access.
+        connection.execute_batch("CREATE TABLE mobile_devices(endpoint_id TEXT PRIMARY KEY,name TEXT NOT NULL,paired_at TEXT NOT NULL,last_seen TEXT NOT NULL);
+            INSERT INTO mobile_devices VALUES('legacy','Old phone','now','now');").unwrap();
+        initialise_schema(&db).unwrap();
+        initialise_schema(&db).unwrap();
+        assert!(!device_stream_only(&db, "legacy").unwrap());
+        let endpoint = SecretKey::generate().public().to_string();
+        let mut sessions = vec![
+            PairingSession {
+                token: "full".into(),
+                stream_only: false,
+                expires_at: Utc::now().timestamp() + 60,
+            },
+            PairingSession {
+                token: "stream".into(),
+                stream_only: true,
+                expires_at: Utc::now().timestamp() + 60,
+            },
+            PairingSession {
+                token: "expired".into(),
+                stream_only: true,
+                expires_at: Utc::now().timestamp() - 1,
+            },
+        ];
+        assert!(accept_pairing(&db, &mut sessions, &endpoint, "expired", "Guest", true).is_err());
+        assert!(accept_pairing(&db, &mut sessions, &endpoint, "wrong", "Guest", true).is_err());
+        assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest", false).is_err());
+        assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest", true).unwrap());
+        assert!(device_stream_only(&db, &endpoint).unwrap());
+        assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest", true).is_err());
+        assert!(!accept_pairing(&db, &mut sessions, &endpoint, "full", "Owner", false).unwrap());
+        assert!(!device_stream_only(&db, &endpoint).unwrap());
+        assert!(sessions.is_empty());
+        sessions.push(PairingSession {
+            token: "downgrade".into(),
+            stream_only: true,
+            expires_at: Utc::now().timestamp() + 60,
+        });
+        assert!(accept_pairing(&db, &mut sessions, &endpoint, "downgrade", "Guest", true).unwrap());
+        assert!(
+            load_devices(&db)
+                .unwrap()
+                .iter()
+                .find(|device| device.endpoint_id == endpoint)
+                .unwrap()
+                .stream_only
+        );
+        connection
+            .execute(
+                "DELETE FROM mobile_devices WHERE endpoint_id=?1",
+                [&endpoint],
+            )
+            .unwrap();
+        assert!(device_stream_only(&db, &endpoint).is_err());
+        drop(connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn device_names_cannot_include_control_characters() {

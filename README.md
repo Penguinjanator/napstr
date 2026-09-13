@@ -54,6 +54,7 @@ Privacy & Security → Open Anyway**. Apple Silicon and Intel builds both includ
 - Nostr publishes the searchable catalogue, live seeders, NIP-C7 trollbox, and per-track discussions; NIP-17 handles private download negotiation.
 - A bundled Tor process carries transfers without a direct-IP fallback.
 - The optional Napstrfy companion pairs by one-use QR and reaches the running desktop over encrypted Iroh.
+- The Mobile page has separate full-access and read-only streaming QR codes. Stream-only phones can listen to the local catalogue without download requests or offline song caching; see [pairing details](android/README.md#build-and-install-a-debug-apk).
 - One recursively watched folder contains both downloads and shared audio.
 - Napstr uses or creates a non-destructive `Audiobooks` drop zone: each child folder becomes an ordered book and each loose audio file becomes a one-file book. Existing contents are never replaced.
 - Files are audio-validated and identified by SHA-256. Downloads use a responsive seeder, verify the complete hash, and are available in the built-in player.

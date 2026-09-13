@@ -52,6 +52,7 @@ Privacy & Security → Open Anyway**. Apple Silicon and Intel builds both includ
 
 - On first launch, Napstr creates a Nostr identity and securely stores its private key using your operating system's credential store.
 - Nostr publishes the searchable catalogue, live seeders, NIP-C7 trollbox, and per-track discussions; NIP-17 handles private download negotiation.
+- Click a user name in seeder lists, profiles, or chat to browse that user's currently shared tracks in Search. Clear the name and search again to return to normal song searches. Exact names already discovered by Napstr and full public keys (`npub` or hex) can also be searched; duplicate names offer a choice of public keys.
 - A bundled Tor process carries transfers without a direct-IP fallback.
 - The optional Napstrfy companion pairs by one-use QR and reaches the running desktop over encrypted Iroh.
 - The Mobile page has separate full-access and read-only streaming QR codes. Stream-only phones can listen to the local catalogue without download requests or offline song caching; see [pairing details](android/README.md#build-and-install-a-debug-apk).

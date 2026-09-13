@@ -161,7 +161,16 @@ pub struct CatalogueBrowsePage {
     pub total_available: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogueUser {
+    pub pubkey: String,
+    pub npub: String,
+    pub display_name: String,
+}
+
 struct CatalogueBrowseSession {
+    author: Option<PublicKey>,
     created_at: Instant,
     online: HashSet<(String, String)>,
     available_by_file: HashMap<String, HashSet<String>>,
@@ -252,17 +261,39 @@ fn catalogue_name_search_filter(query: &str) -> Filter {
         .limit(NETWORK_SEARCH_RESULT_LIMIT)
 }
 
-fn catalogue_identifier_filter(file_ids: &[String]) -> Filter {
-    Filter::new()
+fn restrict_availability_to_author(
+    online: &mut HashSet<(String, String)>,
+    available_by_file: &mut HashMap<String, HashSet<String>>,
+    author: &str,
+) {
+    online.retain(|(source, _)| source == author);
+    available_by_file.retain(|_, sources| {
+        sources.retain(|source| source == author);
+        !sources.is_empty()
+    });
+}
+
+fn catalogue_user_matches(query: &str, name: &str) -> bool {
+    !query.trim().is_empty() && query.trim().to_lowercase() == name.trim().to_lowercase()
+}
+
+fn catalogue_identifier_filter(file_ids: &[String], author: Option<PublicKey>) -> Filter {
+    let filter = Filter::new()
         .kind(Kind::from(CATALOGUE_KIND))
         .hashtag("napstr")
         .identifiers(file_ids.iter().cloned())
-        .limit(file_ids.len().saturating_mul(8).clamp(1, 1_000))
+        .limit(file_ids.len().saturating_mul(8).clamp(1, 1_000));
+    if let Some(author) = author {
+        filter.author(author)
+    } else {
+        filter
+    }
 }
 
 async fn fetch_catalogue_identifiers(
     client: &Client,
     file_ids: &[String],
+    author: Option<PublicKey>,
 ) -> Result<(Vec<Event>, Vec<String>), String> {
     let batches = file_ids
         .chunks(CATALOGUE_IDENTIFIER_BATCH_SIZE)
@@ -272,9 +303,8 @@ async fn fetch_catalogue_identifiers(
         .map(|batch| {
             let client = client.clone();
             async move {
-                let result = client
-                    .fetch_events(catalogue_identifier_filter(&batch), Duration::from_secs(8))
-                    .await;
+                let filter = catalogue_identifier_filter(&batch, author);
+                let result = client.fetch_events(filter, Duration::from_secs(8)).await;
                 (batch, result)
             }
         })
@@ -1585,7 +1615,7 @@ impl NetworkService {
             EMPTY_SEARCH_PAGE_LIMIT,
             EMPTY_SEARCH_RESULT_LIMIT,
         ));
-        self.search_inner(query, browse)
+        self.search_inner(query, browse, None)
             .await
             .map(|(results, _, _)| results)
     }
@@ -1597,13 +1627,104 @@ impl NetworkService {
         cache_limit: usize,
     ) -> Result<CatalogueBrowsePage, String> {
         let (results, cursor, total_available) = self
-            .search_inner("", Some((cursor, limit, cache_limit)))
+            .search_inner("", Some((cursor, limit, cache_limit)), None)
             .await?;
         Ok(CatalogueBrowsePage {
             results,
             cursor,
             total_available,
         })
+    }
+
+    pub async fn browse_user(
+        &self,
+        pubkey: &str,
+        cursor: Option<CatalogueBrowseCursor>,
+    ) -> Result<CatalogueBrowsePage, String> {
+        let author = PublicKey::parse(pubkey).map_err(|_| "Invalid user public key")?;
+        let (results, cursor, total_available) = self
+            .search_inner(
+                "",
+                Some((cursor, EMPTY_SEARCH_PAGE_LIMIT, AVAILABILITY_FILE_LIMIT)),
+                Some(author),
+            )
+            .await?;
+        Ok(CatalogueBrowsePage {
+            results,
+            cursor,
+            total_available,
+        })
+    }
+
+    pub async fn resolve_catalogue_user(&self, query: &str) -> Result<Vec<CatalogueUser>, String> {
+        let query = query.trim();
+        if query.is_empty() || query.chars().count() > 120 {
+            return Ok(Vec::new());
+        }
+        let known = self.trollbox_profiles.read().await.clone();
+        if let Ok(key) = PublicKey::parse(query) {
+            let pubkey = key.to_hex();
+            return Ok(vec![CatalogueUser {
+                display_name: known.get(&pubkey).cloned().unwrap_or_else(|| query.into()),
+                npub: key.to_bech32().map_err(|error| error.to_string())?,
+                pubkey,
+            }]);
+        }
+        let mut matches = known
+            .into_iter()
+            .filter(|(_, name)| catalogue_user_matches(query, name))
+            .collect::<HashMap<_, _>>();
+        if let Some(client) = self.client.read().await.clone() {
+            // Names already discovered through chat and seeder profiles can be
+            // resolved without turning every song search into a metadata relay query.
+            let cached = client
+                .database()
+                .query(Filter::new().kind(Kind::Metadata).limit(1_000))
+                .await
+                .ok();
+            if let Some(events) = cached {
+                for event in events.iter() {
+                    if event.kind != Kind::Metadata || event.verify().is_err() {
+                        continue;
+                    }
+                    let Ok(metadata) = Metadata::from_json(&event.content) else {
+                        continue;
+                    };
+                    if [metadata.display_name.as_deref(), metadata.name.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|name| catalogue_user_matches(query, name))
+                    {
+                        matches.insert(
+                            event.pubkey.to_hex(),
+                            safe_trollbox_name(
+                                metadata
+                                    .display_name
+                                    .as_deref()
+                                    .or(metadata.name.as_deref())
+                                    .unwrap_or(query),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        let blocked = blocked_pubkeys(&self.db_path)?;
+        let mut users = matches
+            .into_iter()
+            .filter(|(key, _)| !blocked.contains(key))
+            .filter_map(|(pubkey, display_name)| {
+                let key = PublicKey::parse(&pubkey).ok()?;
+                Some(CatalogueUser {
+                    npub: key.to_bech32().ok()?,
+                    pubkey,
+                    display_name,
+                })
+            })
+            .collect::<Vec<_>>();
+        users.sort_by(|left, right| left.pubkey.cmp(&right.pubkey));
+        users.truncate(32);
+        Ok(users)
     }
 
     pub async fn search_audiobooks(&self, query: &str) -> Result<Vec<AudiobookResult>, String> {
@@ -1786,6 +1907,7 @@ impl NetworkService {
         &self,
         query: &str,
         browse: Option<(Option<CatalogueBrowseCursor>, usize, usize)>,
+        author: Option<PublicKey>,
     ) -> Result<(Vec<CatalogueResult>, Option<CatalogueBrowseCursor>, usize), String> {
         let client = self
             .client
@@ -1794,6 +1916,7 @@ impl NetworkService {
             .clone()
             .ok_or("Nostr is not connected")?;
         let query = query.trim();
+        let author_hex = author.map(|key| key.to_hex());
         let browse_result_limit = browse.as_ref().map(|(_, limit, _)| *limit);
         let mut requested_file_ids = HashSet::new();
         let mut requested_file_id_order = Vec::new();
@@ -1813,7 +1936,14 @@ impl NetworkService {
         if query.is_empty() {
             let (cursor, limit, cache_limit) =
                 browse.unwrap_or((None, EMPTY_SEARCH_PAGE_LIMIT, EMPTY_SEARCH_RESULT_LIMIT));
-            initial_browse_cache_limit = cache_limit.clamp(1, EMPTY_SEARCH_RESULT_LIMIT);
+            initial_browse_cache_limit = cache_limit.clamp(
+                1,
+                if author.is_some() {
+                    AVAILABILITY_FILE_LIMIT
+                } else {
+                    EMPTY_SEARCH_RESULT_LIMIT
+                },
+            );
             if let Some(cursor) = cursor {
                 Uuid::parse_str(&cursor.session_id)
                     .map_err(|_| "invalid catalogue browse cursor".to_string())?;
@@ -1821,6 +1951,12 @@ impl NetworkService {
                 sessions.retain(|_, session| {
                     session.created_at.elapsed() < CATALOGUE_BROWSE_SESSION_LIFETIME
                 });
+                if sessions
+                    .get(&cursor.session_id)
+                    .is_some_and(|session| session.author != author)
+                {
+                    return Err("This catalogue cursor belongs to a different user search".into());
+                }
                 let mut session = sessions.remove(&cursor.session_id).ok_or_else(|| {
                     "catalogue browse session expired; run the empty search again".to_string()
                 })?;
@@ -1835,7 +1971,7 @@ impl NetworkService {
                 }
                 online = session.online.clone();
                 available_by_file = session.available_by_file.clone();
-                match fetch_catalogue_identifiers(&client, &requested_file_id_order).await {
+                match fetch_catalogue_identifiers(&client, &requested_file_id_order, author).await {
                     Ok((events, retry_file_ids)) => {
                         for event in events {
                             events_by_id.insert(event.id, event);
@@ -1855,9 +1991,29 @@ impl NetworkService {
                 }
                 continuation_session = Some((cursor.session_id, session));
             } else {
-                let availability = self.availability_snapshot(&client).await?;
-                online = availability.online.clone();
-                available_by_file = availability.available_by_file.clone();
+                if let Some(author) = author {
+                    online = HashSet::new();
+                    available_by_file = HashMap::new();
+                    let targeted = client
+                        .fetch_events(
+                            availability_search_filter().author(author),
+                            Duration::from_secs(8),
+                        )
+                        .await
+                        .map_err(|error| {
+                            format!("Could not load this user's sharing status: {error}")
+                        })?;
+                    merge_availability_events(targeted.iter(), &mut online, &mut available_by_file);
+                    restrict_availability_to_author(
+                        &mut online,
+                        &mut available_by_file,
+                        &author.to_hex(),
+                    );
+                } else {
+                    let availability = self.availability_snapshot(&client).await?;
+                    online = availability.online.clone();
+                    available_by_file = availability.available_by_file.clone();
+                }
             }
         } else {
             let availability_query = self.availability_snapshot(&client);
@@ -1993,26 +2149,29 @@ impl NetworkService {
             let mut statement = connection
                 .prepare(
                     "SELECT file_id,source_pubkey,filename,title,artist,album,format,mime,size,tags,event_id
-                 FROM remote_catalogue ORDER BY seen_at DESC LIMIT ?1",
+                 FROM remote_catalogue WHERE (?2 IS NULL OR source_pubkey=?2) ORDER BY seen_at DESC LIMIT ?1",
                 )
                 .map_err(|error| error.to_string())?;
             let rows = statement
-                .query_map([CATALOGUE_CACHE_SCAN_LIMIT as i64], |row| {
-                    let size = row.get::<_, i64>(8)?;
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        size,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, String>(10)?,
-                    ))
-                })
+                .query_map(
+                    params![CATALOGUE_CACHE_SCAN_LIMIT as i64, author_hex],
+                    |row| {
+                        let size = row.get::<_, i64>(8)?;
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            size,
+                            row.get::<_, String>(9)?,
+                            row.get::<_, String>(10)?,
+                        ))
+                    },
+                )
                 .map_err(|error| error.to_string())?;
             rows.filter_map(|row| match row {
                 Ok((
@@ -2119,7 +2278,8 @@ impl NetworkService {
             let Ok(content) = serde_json::from_str::<CatalogueContent>(&event.content) else {
                 continue;
             };
-            if !valid_catalogue_event(event, &content)
+            if author.is_some_and(|author| event.pubkey != author)
+                || !valid_catalogue_event(event, &content)
                 || content.protocol != "napstr/1"
                 || !valid_file_id(&content.file_id)
                 || content.size == 0
@@ -2191,6 +2351,7 @@ impl NetworkService {
             if !pending_file_ids.is_empty() {
                 let session_id = Uuid::new_v4().to_string();
                 let session = CatalogueBrowseSession {
+                    author,
                     created_at: Instant::now(),
                     online,
                     available_by_file,
@@ -2228,7 +2389,7 @@ impl NetworkService {
                 return Err(error);
             }
         }
-        let profile_keys = (!query.is_empty())
+        let profile_keys = (!query.is_empty() || author.is_some())
             .then(|| {
                 results
                     .iter()
@@ -2256,6 +2417,14 @@ impl NetworkService {
             .filter_map(|profile| async move { profile })
             .collect()
             .await;
+        {
+            let mut known = self.trollbox_profiles.write().await;
+            for (key, metadata) in &profiles {
+                if let Some(name) = metadata.display_name.as_ref().or(metadata.name.as_ref()) {
+                    known.insert(key.clone(), safe_trollbox_name(name));
+                }
+            }
+        }
         for result in &mut results {
             for source in &mut result.sources {
                 if let Some(metadata) = profiles.get(&source.pubkey) {
@@ -3143,6 +3312,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn user_catalogue_filters_keep_shared_hashes_without_other_publishers() {
+        let author = Keys::generate().public_key();
+        let other = Keys::generate().public_key();
+        let a = author.to_hex();
+        let b = other.to_hex();
+        let shared = "a".repeat(64);
+        let own_only = "b".repeat(64);
+        let other_only = "c".repeat(64);
+        let mut online = HashSet::from([
+            (a.clone(), shared.clone()),
+            (b.clone(), shared.clone()),
+            (a.clone(), own_only.clone()),
+            (b.clone(), other_only.clone()),
+        ]);
+        let mut available = HashMap::from([
+            (shared.clone(), HashSet::from([a.clone(), b.clone()])),
+            (own_only.clone(), HashSet::from([a.clone()])),
+            (other_only.clone(), HashSet::from([b])),
+        ]);
+        restrict_availability_to_author(&mut online, &mut available, &a);
+        assert_eq!(
+            online,
+            HashSet::from([(a.clone(), shared.clone()), (a.clone(), own_only.clone())])
+        );
+        assert_eq!(available.len(), 2);
+        assert_eq!(available[&shared], HashSet::from([a.clone()]));
+        assert!(!available.contains_key(&other_only));
+        let ids = vec![shared, own_only];
+        let filter = serde_json::to_value(catalogue_identifier_filter(&ids, Some(author))).unwrap();
+        assert_eq!(filter["authors"], serde_json::json!([a]));
+        assert_eq!(filter["#d"], serde_json::json!(ids));
+        let normal = serde_json::to_value(catalogue_identifier_filter(&ids, None)).unwrap();
+        assert!(normal.get("authors").is_none());
+    }
+
+    #[test]
+    fn user_name_search_requires_an_exact_name_and_keys_accept_npub() {
+        assert!(catalogue_user_matches(" Alice Smith ", "alice SMITH"));
+        assert!(!catalogue_user_matches("Alice", "Alice Smith"));
+        assert!(!catalogue_user_matches("Alice guitar", "Alice"));
+        assert!(!catalogue_user_matches("", ""));
+        let key = Keys::generate().public_key();
+        assert_eq!(PublicKey::parse(&key.to_bech32().unwrap()).unwrap(), key);
+        assert_eq!(PublicKey::parse(&key.to_hex()).unwrap(), key);
+    }
+
+    #[test]
     fn catalogue_search_filters_are_server_side_and_bounded() {
         let named = serde_json::to_value(catalogue_name_search_filter("metallica")).unwrap();
         assert_eq!(named["kinds"], serde_json::json!([CATALOGUE_KIND]));
@@ -3202,7 +3418,7 @@ mod tests {
         );
 
         let identifiers = vec!["a".repeat(64), "b".repeat(64)];
-        let browse = serde_json::to_value(catalogue_identifier_filter(&identifiers)).unwrap();
+        let browse = serde_json::to_value(catalogue_identifier_filter(&identifiers, None)).unwrap();
         assert_eq!(browse["kinds"], serde_json::json!([CATALOGUE_KIND]));
         assert_eq!(browse["#t"], serde_json::json!(["napstr"]));
         assert_eq!(browse["#d"], serde_json::json!(identifiers));

@@ -33,6 +33,7 @@
     tags?: string;
     audiobook?: Audiobook;
   };
+  type CatalogueUser = { pubkey: string; npub: string; displayName: string };
   type SourceDetail = { pubkey: string; npub: string; displayName: string; relay: string; about: string; picture: string; eventId: string };
   type Transfer = {
     id: number;
@@ -83,6 +84,9 @@
   let results: Result[] = [];
   let resultPage = 0;
   let query = '';
+  let searchUser: CatalogueUser | null = null;
+  let resultUser: CatalogueUser | null = null;
+  let matchingUsers: CatalogueUser[] = [];
   let format = 'Audio only';
   let minimumSources = 1;
   let maximumSize = '';
@@ -719,7 +723,9 @@
   }
 
   function syncResultLocality() {
-    if (resultsAreNetwork) {
+    if (resultUser?.npub === identityNpub) {
+      results = mergeSearchResults([], sharedFiles);
+    } else if (resultsAreNetwork) {
       results = results.map((result) => {
         if (result.audiobook) {
           const localBook = localAudiobooks.find((book) => book.audiobookId === result.audiobook?.audiobookId);
@@ -752,6 +758,9 @@
     downloadLibraryPage = Math.min(downloadLibraryPage, localPageCount(snapshot.files) - 1);
     sharedLibraryPage = Math.min(sharedLibraryPage, localPageCount(visibleSharedFiles()) - 1);
     if (selectedShared) selectedShared = snapshot.files.find((file) => file.fileId === selectedShared?.fileId) ?? null;
+    resultUser = null;
+    searchUser = null;
+    matchingUsers = [];
     results = mergeAudiobooks(mapFiles(snapshot.files), [], '');
     resultPage = 0;
     resultsAreNetwork = false;
@@ -1206,8 +1215,32 @@
     return nativeReady ? 'Tor connecting' : 'Tor unavailable';
   }
 
-  async function search() {
-    if (searchAction) return;
+  async function browseUser(user: CatalogueUser) {
+    activeView = 'Search';
+    sourceProfile = null;
+    query = user.displayName;
+    searchUser = user;
+    format = 'Audio only';
+    minimumSources = 1;
+    maximumSize = '';
+    await search(true);
+  }
+
+  function ownCatalogueUser(): CatalogueUser {
+    return { pubkey: identityNpub, npub: identityNpub, displayName };
+  }
+
+  function knownUsersNamed(value: string): CatalogueUser[] {
+    const name = value.trim().toLocaleLowerCase();
+    const users: CatalogueUser[] = [
+      ...results.flatMap((item) => item.sourceDetails ?? []),
+      ...trollboxMessages, ...trackDiscussionMessages, ownCatalogueUser()
+    ];
+    return users.filter((user) => user.npub && user.displayName.trim().toLocaleLowerCase() === name);
+  }
+
+  async function search(replacePending = false) {
+    if (searchAction && !replacePending) return;
     const generation = ++browseGeneration;
     browseCursor = null;
     browseLoading = false;
@@ -1215,8 +1248,51 @@
     loadedNetworkAudiobooks = [];
     browseTotalAvailable = 0;
     searchAction = 'search';
+    resultUser = null;
+    matchingUsers = [];
     try {
       const trimmedQuery = query.trim();
+      let user = searchUser && [searchUser.displayName, searchUser.npub, searchUser.pubkey].some((name) => name.trim() === trimmedQuery) ? searchUser : null;
+      searchUser = user;
+      if (!user && trimmedQuery) {
+        const known = knownUsersNamed(trimmedQuery);
+        try {
+          const users = networkConnected ? await invoke<CatalogueUser[]>('resolve_catalogue_user', { query: trimmedQuery }) : [];
+          if (generation !== browseGeneration) return;
+          matchingUsers = [...new Map([...known, ...users].map((user) => [user.npub, user])).values()];
+        } catch { if (generation === browseGeneration) matchingUsers = [...new Map(known.map((user) => [user.npub, user])).values()]; }
+        if (generation !== browseGeneration) return;
+        if (matchingUsers.length === 1) user = matchingUsers[0];
+      }
+      if (user) {
+        searchUser = user;
+        resultUser = user;
+        matchingUsers = [];
+        searchedQuery = user.displayName;
+        format = 'Audio only';
+        results = [];
+        resultsAreNetwork = true;
+        resultPage = 0;
+        selectResult(null);
+        try {
+          if (user.npub === identityNpub) {
+            results = mergeSearchResults([], sharedFiles);
+          } else {
+            const page = await invoke<CatalogueBrowsePage>('network_browse_user', { pubkey: user.pubkey, cursor: null });
+            if (generation !== browseGeneration) return;
+            loadedNetworkMatches = page.results;
+            browseCursor = page.cursor;
+            browseTotalAvailable = page.totalAvailable;
+            results = mergeSearchResults(loadedNetworkMatches, []);
+          }
+          activityMessage = `${results.length} tracks loaded from ${user.displayName}`;
+          selectResult(results[0] ?? null, true);
+          if (browseCursor) void loadNextBrowsePage();
+        } catch (error) {
+          if (generation === browseGeneration) activityMessage = `Could not browse ${user.displayName}: ${String(error)}`;
+        }
+        return;
+      }
       searchedQuery = trimmedQuery || (format === 'Audiobooks' ? 'All audiobooks' : 'All audio');
       if (networkConnected) {
         if (format === 'Audiobooks') {
@@ -1296,10 +1372,11 @@
       } else if (nativeReady) {
         try {
           const matches = await invoke<NativeFile[]>('search_catalog', { query: query.trim() });
+          if (generation !== browseGeneration) return;
           results = mergeAudiobooks(mapFiles(matches.filter((item) => minimumSources <= 1 && item.size <= maximumBytes() && matchesType(item.mime, item.format))), [], query.trim());
           resultsAreNetwork = false;
           activityMessage = `${results.length} local match(es) found`;
-        } catch (error) { activityMessage = `Search failed: ${String(error)}`; }
+        } catch (error) { if (generation === browseGeneration) activityMessage = `Search failed: ${String(error)}`; }
       }
       resultPage = 0;
       selectResult(results[0] ?? null, true);
@@ -1313,20 +1390,25 @@
 
   async function loadNextBrowsePage() {
     const cursor = browseCursor;
-    if (!cursor || browseLoading || query.trim()) return;
+    const user = resultUser;
+    if (!cursor || browseLoading || (!user && query.trim())) return;
     const generation = browseGeneration;
     browseLoading = true;
     activityMessage = `${results.length} available file ID(s) loaded · fetching the next relay page…`;
     try {
-      const page = await invoke<CatalogueBrowsePage>('network_browse', { cursor, limit: 500, cacheLimit: 10000 });
-      if (generation !== browseGeneration || query.trim()) return;
+      const page = user
+        ? await invoke<CatalogueBrowsePage>('network_browse_user', { pubkey: user.pubkey, cursor })
+        : await invoke<CatalogueBrowsePage>('network_browse', { cursor, limit: 500, cacheLimit: 10000 });
+      if (generation !== browseGeneration || (!user && query.trim())) return;
       loadedNetworkMatches = mergeNetworkPages(loadedNetworkMatches, page.results);
       browseCursor = page.cursor;
       browseTotalAvailable = page.totalAvailable;
-      results = mergeAudiobooks(mergeSearchResults(loadedNetworkMatches, sharedFiles), loadedNetworkAudiobooks, '');
+      results = user ? mergeSearchResults(loadedNetworkMatches, []) : mergeAudiobooks(mergeSearchResults(loadedNetworkMatches, sharedFiles), loadedNetworkAudiobooks, '');
       resultsAreNetwork = true;
       reconcileResultSelection();
-      activityMessage = `${results.length} loaded of ${availableResultTotal()} currently available file ID(s), ranked by active seeders`;
+      activityMessage = user
+        ? `${results.length} loaded of ${availableResultTotal()} tracks shared by ${user.displayName}`
+        : `${results.length} loaded of ${availableResultTotal()} currently available file ID(s), ranked by active seeders`;
     } catch (error) {
       if (generation === browseGeneration) activityMessage = `Could not load the next catalogue page: ${String(error)}`;
     } finally {
@@ -1340,20 +1422,25 @@
       activityMessage = 'Connect to Nostr before asking for a surprise';
       return;
     }
-    browseGeneration += 1;
+    const generation = ++browseGeneration;
     browseCursor = null;
     browseLoading = false;
     loadedNetworkMatches = [];
     loadedNetworkAudiobooks = [];
     browseTotalAvailable = 0;
     searchAction = 'surprise';
+    searchUser = null;
+    resultUser = null;
+    matchingUsers = [];
     searchedQuery = 'Surprise me';
     activityMessage = 'Finding 50 random downloadable tracks…';
     try {
       const page = await invoke<CatalogueBrowsePage>('network_browse', { cursor: null, limit: 50, cacheLimit: 50 });
+      if (generation !== browseGeneration) return;
       let matches = page.results;
       if (matches.length < 50 && page.cursor) {
         const missing = await invoke<CatalogueBrowsePage>('network_browse', { cursor: page.cursor, limit: 50, cacheLimit: 50 });
+        if (generation !== browseGeneration) return;
         matches = mergeNetworkPages(matches, missing.results);
       }
       const downloadable = eligibleNetworkMatches(matches)
@@ -1366,9 +1453,9 @@
         ? `${results.length} random downloadable track${results.length === 1 ? '' : 's'} found`
         : 'No downloadable tracks are currently available';
     } catch (error) {
-      activityMessage = `Surprise search failed: ${String(error)}`;
+      if (generation === browseGeneration) activityMessage = `Surprise search failed: ${String(error)}`;
     } finally {
-      searchAction = null;
+      if (generation === browseGeneration) searchAction = null;
     }
   }
 
@@ -2026,7 +2113,7 @@
     <div class="network-strip">
       <span class="network-pulse">▥</span>
       <span>{activityMessage}</span>
-      <span class="strip-right">{displayName} <i class:amber={!nativeReady} class="led"></i></span>
+      <span class="strip-right"><button class="user-name" disabled={!identityNpub} onclick={() => browseUser(ownCatalogueUser())}>{displayName}</button> <i class:amber={!nativeReady} class="led"></i></span>
     </div>
 
     <section class="player-bar" aria-label="Napstr audio player">
@@ -2072,6 +2159,11 @@
               {searchAction === 'surprise' ? 'Choosing…' : 'Surprise me'}
             </button>
           </form>
+          {#if resultUser}
+            <div class="user-search-status"><span>Shared by <b>{resultUser.displayName}</b> <code title={resultUser.npub}>{resultUser.npub.slice(0, 18)}…</code></span><button class="classic-button" disabled={searchAction !== null} onclick={() => { query = ''; searchUser = null; void search(); }}>Clear user filter</button></div>
+          {:else if matchingUsers.length > 1}
+            <div class="user-search-status"><span>Several users have this name. Choose whose songs to browse:</span>{#each matchingUsers as user}<button class="classic-button" title={user.npub} onclick={() => browseUser(user)}>{user.displayName} · {user.npub.slice(0, 18)}…</button>{/each}</div>
+          {/if}
           <button class="advanced-toggle" onclick={() => (advanced = !advanced)}><span>{advanced ? '▼' : '▶'}</span> {advanced ? 'Hide' : 'Show'} advanced search options</button>
           {#if advanced}
             <div class="advanced-row"><label>Minimum seeders: <input type="number" bind:value={minimumSources} min="1" /></label><label>Maximum size: <input bind:value={maximumSize} placeholder="e.g. 2 GB" /></label><label><input type="checkbox" checked disabled /> Online seeders only</label></div>
@@ -2144,7 +2236,7 @@
                 <div class="sources-list">
                   {#if !isLocalFile(selected.fileId)}
                     {#each (selected.sourceDetails ?? []).slice(0, VISIBLE_SEEDER_LIMIT) as source, index}
-                      <button class:selected-source={selectedSource === index} class="source-row" onclick={() => (selectedSource = index)}><span class="user-icon">☺</span><b>{source.displayName}</b><small>{source.npub.slice(0, 12)}…</small><span class="online"><i></i> Seeding</span></button>
+                      <div class:selected-source={selectedSource === index} class="source-row"><button class="user-icon source-select" title={`Select ${source.displayName} for profile and moderation actions`} onclick={() => (selectedSource = index)}>☺</button><button class="user-name" title={`Browse songs shared by ${source.displayName}`} onclick={() => browseUser(source)}>{source.displayName}</button><small>{source.npub.slice(0, 12)}…</small><span class="online"><i></i> Seeding</span></div>
                     {/each}
                   {:else}
                     <div><span class="user-icon">☺</span><b>This computer</b><small>Local</small><span class="online"><i></i> Ready</span></div>
@@ -2160,7 +2252,7 @@
                   {#if trackDiscussionLoading}<p class="trollbox-notice">Loading comments…</p>{/if}
                   {#if !trackDiscussionLoading && trackDiscussionMessages.length === 0 && !trackDiscussionError}<p class="trollbox-notice">No comments yet.</p>{/if}
                   {#each trackDiscussionMessages as message (message.eventId)}
-                    <div class="trollbox-message"><button class="trollbox-name" style:color={chatNameColor(message.npub)} title={`${message.npub} · click to block`} disabled={message.npub === identityNpub} onclick={() => blockTrollboxUser(message)}>{message.displayName}:</button><span>{message.content}</span></div>
+                    <div class="trollbox-message"><button class="trollbox-name" style:color={chatNameColor(message.npub)} title={`Browse songs shared by ${message.displayName} · ${message.npub}`} onclick={() => browseUser(message)}>{message.displayName}:</button><span>{message.content}</span>{#if message.npub !== identityNpub}<button class="chat-block" aria-label={`Block ${message.displayName}`} onclick={() => blockTrollboxUser(message)}>Block</button>{/if}</div>
                   {/each}
                 </div>
                 {#if trackDiscussionError}<div class="track-discussion-error">{trackDiscussionError}</div>{/if}
@@ -2241,7 +2333,7 @@
             {#if trollboxLoading}<p class="trollbox-notice">Connecting to the trollbox…</p>{/if}
             {#if !trollboxLoading && trollboxMessages.length === 0 && !trollboxError}<p class="trollbox-notice">No messages yet. Say hello.</p>{/if}
             {#each trollboxMessages as message (message.eventId)}
-              <div class="trollbox-message"><button class="trollbox-name" style:color={chatNameColor(message.npub)} title={`${message.npub} · click to block`} disabled={message.npub === identityNpub} onclick={() => blockTrollboxUser(message)}>{message.displayName}:</button><span>{message.content}</span></div>
+              <div class="trollbox-message"><button class="trollbox-name" style:color={chatNameColor(message.npub)} title={`Browse songs shared by ${message.displayName} · ${message.npub}`} onclick={() => browseUser(message)}>{message.displayName}:</button><span>{message.content}</span>{#if message.npub !== identityNpub}<button class="chat-block" aria-label={`Block ${message.displayName}`} onclick={() => blockTrollboxUser(message)}>Block</button>{/if}</div>
             {/each}
           </div>
           {#if trollboxError}<div class="trollbox-error">{trollboxError}</div>{/if}
@@ -2298,7 +2390,7 @@
       {:else if activeView === 'Profile'}
         <section class="full-panel profile-view">
           <div class="panel-title"><span></span><b>Napstr Profile</b><span></span></div>
-          <div class="profile-card"><div class="avatar"><img src="/napstr-logo.png" alt="Napstr mascot" /></div><div><h2>{displayName}</h2><p>Your dedicated Napstr Nostr identity.</p><code>{identityNpub || 'Connect to create identity'}</code><div class="profile-stats"><span><b>{sharedFiles.length}</b> shared files</span><span><b>{transfers.length}</b> transfers</span><span><b>{networkConnected ? 'Nostr online' : 'Offline'}</b></span></div></div></div>
+          <div class="profile-card"><div class="avatar"><img src="/napstr-logo.png" alt="Napstr mascot" /></div><div><h2><button class="user-name" disabled={!identityNpub} onclick={() => browseUser(ownCatalogueUser())}>{displayName}</button></h2><p>Your dedicated Napstr Nostr identity.</p><code>{identityNpub || 'Connect to create identity'}</code><div class="profile-stats"><span><b>{sharedFiles.length}</b> shared files</span><span><b>{transfers.length}</b> transfers</span><span><b>{networkConnected ? 'Nostr online' : 'Offline'}</b></span></div></div></div>
           <fieldset class="edit-profile"><legend>Profile</legend><label>Display name <input bind:value={displayName} /></label><label>About <input bind:value={profileAbout} /></label><label>Picture URL <input bind:value={profilePicture} placeholder="https://…" /></label><button class="classic-button primary" onclick={persistSettings}>Save profile</button></fieldset>
           <p class="privacy-note wide"><span>i</span> Your profile and shared catalogue are public on Nostr. Transfer addresses and credentials are never published.</p>
         </section>
@@ -2353,7 +2445,7 @@
     <div class="modal-backdrop" role="presentation" onclick={() => (sourceProfile = null)}>
       <dialog class="dialog" open aria-label="Napstr public profile" onclick={(e) => e.stopPropagation()}>
         <header class="titlebar"><div class="title-left"><span class="app-icon"><img src="/napstr-logo.png" alt="" /></span><span>Public Napstr Profile</span></div><div class="window-controls"><button onclick={() => (sourceProfile = null)}>×</button></div></header>
-        <div class="dialog-body"><div class="about-logo">☺</div><div><h2>{sourceProfile.displayName}</h2><p>{sourceProfile.about || 'No profile description published.'}</p><code>{sourceProfile.npub}</code></div></div>
+        <div class="dialog-body"><div class="about-logo">☺</div><div><h2><button class="user-name" onclick={() => browseUser(sourceProfile!)}>{sourceProfile.displayName}</button></h2><p>{sourceProfile.about || 'No profile description published.'}</p><code>{sourceProfile.npub}</code></div></div>
         <div class="dialog-actions"><button class="classic-button primary" onclick={() => (sourceProfile = null)}>OK</button></div>
       </dialog>
     </div>

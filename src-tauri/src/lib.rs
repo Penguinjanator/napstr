@@ -1947,6 +1947,23 @@ async fn network_browse(
 }
 
 #[tauri::command]
+async fn network_browse_user(
+    pubkey: String,
+    cursor: Option<network::CatalogueBrowseCursor>,
+    state: State<'_, AppState>,
+) -> Result<network::CatalogueBrowsePage, String> {
+    state.network.browse_user(&pubkey, cursor).await
+}
+
+#[tauri::command]
+async fn resolve_catalogue_user(
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<network::CatalogueUser>, String> {
+    state.network.resolve_catalogue_user(&query).await
+}
+
+#[tauri::command]
 async fn get_trollbox_messages(
     state: State<'_, AppState>,
 ) -> Result<Vec<network::TrollboxMessage>, String> {
@@ -2217,6 +2234,8 @@ pub fn run() {
             network_search,
             network_search_audiobooks,
             network_browse,
+            network_browse_user,
+            resolve_catalogue_user,
             get_trollbox_messages,
             send_trollbox_message,
             get_track_discussion_messages,

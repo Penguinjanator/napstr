@@ -319,3 +319,10 @@ body.resizing-transfer-pane, body.resizing-transfer-pane * { cursor: ns-resize !
 }
 
 .mobile-connect-grid > .paired-devices-card { grid-column: 1 / -1; }
+
+.user-name { min-width: 0; padding: 0; overflow: hidden; color: inherit; background: transparent; border: 0; font: inherit; font-weight: bold; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.user-name:hover { text-decoration: underline; }
+.source-select { padding: 0; color: inherit; background: transparent; border: 0; cursor: pointer; }
+.user-search-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 5px 10px; }
+.user-search-status code { font-size: 10px; }
+.chat-block { margin-left: auto; padding: 0 3px; color: #666; background: transparent; border: 0; font-size: 10px; cursor: pointer; }

@@ -1056,7 +1056,7 @@
 
     {#if activeTab === 'music'}
       <section class="search-area">
-        <form onsubmit={(event) => { event.preventDefault(); void searchTracks(); }}>
+        <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void searchTracks(); }}>
           <span>⌕</span><input bind:value={query} placeholder={status.streamOnly ? "Search Napstr’s music" : "Search your music and Nostr"} aria-label="Search tracks" />
           {#if query}<button type="button" class="clear-search" onclick={() => searchTracks('')}>×</button>{/if}
         </form>
@@ -1075,8 +1075,11 @@
           <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class="track-row">
             <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
               <TrackArtwork {track} lookup={index < 24} />
-              <span class="track-copy"><strong>{title(track)}</strong><small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small></span>
-              <span class="track-meta">{track.local ? readableSize(track.size) : `${track.sources.length} ${track.sources.length === 1 ? 'seeder' : 'seeders'}`}</span>
+              <span class="track-copy">
+                <strong>{title(track)}</strong>
+                <small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small>
+                <span class="track-meta">{readableSize(track.size)}{#if !track.local} · {track.sources.length} {track.sources.length === 1 ? 'seeder' : 'seeders'}{/if}</span>
+              </span>
               <span class="track-action">{pending.has(track.fileId) ? '···' : track.local ? '⋮' : status.streamOnly ? 'Unavailable' : '⇩'}</span>
             </button>
             <button class:liked={isTrackLiked(track)} class="like-button" onclick={() => toggleTrackLike(track)} aria-label={`${isTrackLiked(track) ? 'Unlike' : 'Like'} ${title(track)}`}>{isTrackLiked(track) ? '♥' : '♡'}</button>
@@ -1086,7 +1089,7 @@
       </section>
     {:else if activeTab === 'podcasts'}
       <section class="search-area podcast-search">
-        <form onsubmit={(event) => { event.preventDefault(); void searchPodcasts(); }}>
+        <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void searchPodcasts(); }}>
           <span>⌕</span><input bind:value={podcastQuery} placeholder="Search podcasts" aria-label="Search podcasts" />
           {#if podcastQuery}<button type="button" class="clear-search" onclick={() => { podcastQuery = ''; void loadTrendingPodcasts(); }}>×</button>{/if}
         </form>
@@ -1145,7 +1148,7 @@
       {/if}
     {:else}
       <section class="search-area audiobook-search">
-        <form onsubmit={(event) => { event.preventDefault(); void loadAudiobooks(); }}>
+        <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void loadAudiobooks(); }}>
           <span>⌕</span><input bind:value={audiobookQuery} placeholder="Search audiobooks" aria-label="Search audiobooks" />
           {#if audiobookQuery}<button type="button" class="clear-search" onclick={() => { audiobookQuery = ''; void loadAudiobooks(); }}>×</button>{/if}
         </form>

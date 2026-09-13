@@ -7,7 +7,7 @@ use iroh::{endpoint::presets, Endpoint, SecretKey};
 use napstr_remote_protocol::{
     ClientRequest, PairingTicket, RemoteAudiobook, RemoteAudiobookSummary, RemoteSource,
     RemoteTrack, RemoteTransfer, ServerResponse, ALPN, MAX_CONTROL_FRAME_BYTES, MAX_PAGE_SIZE,
-    MAX_STREAM_CHUNK_BYTES, PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
 };
 use qrcode::{render::svg, QrCode};
 use rusqlite::{params, OptionalExtension};
@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncReadExt;
 
 const PAIRING_LIFETIME_SECONDS: i64 = 5 * 60;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -467,11 +467,10 @@ impl MobileService {
         if let ClientRequest::Pair {
             token,
             device_name,
-            supports_streaming,
         } = request
         {
             let stream_only =
-                self.accept_pairing(remote_id, &token, &device_name, supports_streaming)?;
+                self.accept_pairing(remote_id, &token, &device_name)?;
             return write_response(
                 send,
                 &ServerResponse::Paired {
@@ -693,29 +692,6 @@ impl MobileService {
                 }
                 Ok(())
             }
-            ClientRequest::StreamAudio {
-                file_id,
-                offset,
-                length,
-            } => {
-                let track = local_track(&self.db_path, &file_id)?;
-                validate_stream_range(track.size, offset, length)?;
-                let path = secure_audio_path(&self.db_path, &file_id)?;
-                let mut file = tokio::fs::File::open(path)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                file.seek(std::io::SeekFrom::Start(offset))
-                    .await
-                    .map_err(|error| error.to_string())?;
-                // A bounded in-memory chunk; each subsequent range is authorised again.
-                let mut bytes = vec![0; length as usize];
-                file.read_exact(&mut bytes)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                self.authorise(remote_id)?;
-                write_response(send, &ServerResponse::AudioReady { track }).await?;
-                write_bytes(send, &bytes).await
-            }
             ClientRequest::Available { file_ids } => {
                 if file_ids.len() > MAX_PAGE_SIZE
                     || file_ids.iter().any(|file_id| !is_sha256_file_id(file_id))
@@ -754,7 +730,6 @@ impl MobileService {
         remote_id: &str,
         token: &str,
         name: &str,
-        supports_streaming: bool,
     ) -> Result<bool, String> {
         let mut pairing = self
             .pairing
@@ -766,7 +741,6 @@ impl MobileService {
             remote_id,
             token,
             name,
-            supports_streaming,
         )
     }
 
@@ -800,7 +774,6 @@ fn accept_pairing(
     remote_id: &str,
     token: &str,
     name: &str,
-    _supports_streaming: bool,
 ) -> Result<bool, String> {
     let now = Utc::now();
     pairing.retain(|session| session.expires_at >= now.timestamp());
@@ -848,19 +821,11 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
         | ClientRequest::AudiobookLibrary { .. }
         | ClientRequest::Audiobook { .. }
         | ClientRequest::FetchAudio { .. }
-        | ClientRequest::StreamAudio { .. }
         | ClientRequest::Available { .. }
         | ClientRequest::Status
         | ClientRequest::Ping => Ok(()),
         _ => Err("This phone has read-only access. Downloads on the Napstr host are not permitted.".into()),
     }
-}
-
-fn validate_stream_range(size: u64, offset: u64, length: u64) -> Result<(), String> {
-    if length == 0 || length > MAX_STREAM_CHUNK_BYTES || offset >= size || length > size - offset {
-        return Err("Invalid audio streaming range".into());
-    }
-    Ok(())
 }
 
 fn is_sha256_file_id(value: &str) -> bool {
@@ -1318,15 +1283,6 @@ mod tests {
         ).is_ok());
         assert!(check_request_permission(
             true,
-            &ClientRequest::StreamAudio {
-                file_id: "a".repeat(64),
-                offset: 1,
-                length: 32
-            }
-        )
-        .is_ok());
-        assert!(check_request_permission(
-            true,
             &ClientRequest::Library {
                 query: String::new(),
                 offset: 0,
@@ -1334,22 +1290,6 @@ mod tests {
             }
         )
         .is_ok());
-    }
-
-    #[test]
-    fn streaming_ranges_are_bounded_and_cannot_overflow() {
-        assert!(validate_stream_range(100, 99, 1).is_ok());
-        assert!(validate_stream_range(MAX_STREAM_CHUNK_BYTES, 0, MAX_STREAM_CHUNK_BYTES).is_ok());
-        for (size, offset, length) in [
-            (0, 0, 1),
-            (100, 0, 0),
-            (100, 100, 1),
-            (100, 99, 2),
-            (u64::MAX, u64::MAX - 1, 2),
-            (u64::MAX, 0, MAX_STREAM_CHUNK_BYTES + 1),
-        ] {
-            assert!(validate_stream_range(size, offset, length).is_err());
-        }
     }
 
     #[test]
@@ -1383,13 +1323,13 @@ mod tests {
                 expires_at: Utc::now().timestamp() - 1,
             },
         ];
-        assert!(accept_pairing(&db, &mut sessions, &endpoint, "expired", "Guest", true).is_err());
-        assert!(accept_pairing(&db, &mut sessions, &endpoint, "wrong", "Guest", true).is_err());
+        assert!(accept_pairing(&db, &mut sessions, &endpoint, "expired", "Guest").is_err());
+        assert!(accept_pairing(&db, &mut sessions, &endpoint, "wrong", "Guest").is_err());
         // Older clients can also fetch/cache audio; the host enforces their read-only grant.
-        assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest", false).unwrap());
+        assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest").unwrap());
         assert!(device_stream_only(&db, &endpoint).unwrap());
-        assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest", true).is_err());
-        assert!(!accept_pairing(&db, &mut sessions, &endpoint, "full", "Owner", false).unwrap());
+        assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest").is_err());
+        assert!(!accept_pairing(&db, &mut sessions, &endpoint, "full", "Owner").unwrap());
         assert!(!device_stream_only(&db, &endpoint).unwrap());
         assert!(sessions.is_empty());
         sessions.push(PairingSession {
@@ -1397,7 +1337,7 @@ mod tests {
             stream_only: true,
             expires_at: Utc::now().timestamp() + 60,
         });
-        assert!(accept_pairing(&db, &mut sessions, &endpoint, "downgrade", "Guest", true).unwrap());
+        assert!(accept_pairing(&db, &mut sessions, &endpoint, "downgrade", "Guest").unwrap());
         assert!(
             load_devices(&db)
                 .unwrap()

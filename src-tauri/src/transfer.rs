@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufWriter, SeekFrom},
     net::TcpListener,
     sync::{watch, Mutex, Notify, RwLock, Semaphore},
@@ -104,39 +104,40 @@ async fn create_temporary_file(
     prefix: &str,
     source_name: &Path,
 ) -> Result<(File, TemporaryPath), String> {
-    for _ in 0..16 {
-        let extension = source_name
-            .extension()
-            .and_then(|value| value.to_str())
-            .filter(|value| value.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-            .map(|value| format!(".{value}"))
-            .unwrap_or_default();
-        let path = directory.join(format!(
-            ".{prefix}-{}{extension}.part",
-            uuid::Uuid::new_v4()
-        ));
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await
-        {
-            Ok(file) => {
-                #[cfg(unix)]
-                fs::set_permissions(&path, {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::Permissions::from_mode(0o600)
-                })
-                .await
-                .map_err(|error| error.to_string())?;
-                return Ok((file, TemporaryPath { path }));
+    let directory = directory.to_owned();
+    let prefix = prefix.to_owned();
+    let extension = source_name
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| value.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    // Keep creation and ownership in the same blocking task. If the caller is
+    // cancelled during open, dropping the task's result still removes the file.
+    let (file, guard) = tokio::task::spawn_blocking(move || {
+        for _ in 0..16 {
+            let path = directory.join(format!(
+                ".{prefix}-{}{extension}.part",
+                uuid::Uuid::new_v4()
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.to_string()),
+            match options.open(&path) {
+                Ok(file) => return Ok((file, TemporaryPath { path })),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.to_string()),
+            }
         }
-    }
-    Err("could not create a private transfer file".into())
+        Err("could not create a private transfer file".to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    Ok((File::from_std(file), guard))
 }
 
 fn ensure_secure_child_directory(parent: &Path, name: &std::ffi::OsStr) -> Result<PathBuf, String> {
@@ -1107,6 +1108,54 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use tokio::io::{duplex, DuplexStream};
+
+    #[test]
+    fn cancellation_during_file_creation_cleans_up() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory =
+                std::env::temp_dir().join(format!("napstr-cancel-race-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let (release, wait) = std::sync::mpsc::channel();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                wait.recv().unwrap();
+            });
+            ready.await.unwrap();
+            let token = CancellationToken::new();
+            let child_token = token.clone();
+            let target = directory.clone();
+            let worker = tokio::spawn(async move {
+                until_cancelled(&child_token, async move {
+                    let (_file, _guard) =
+                        create_temporary_file(&target, "napstr-download", Path::new("song.mp3"))
+                            .await?;
+                    std::future::pending::<Result<(), String>>().await
+                })
+                .await
+            });
+            tokio::task::yield_now().await;
+            token.cancel();
+            assert_eq!(worker.await.unwrap().unwrap_err(), "cancelled");
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            let paths = std::fs::read_dir(&directory)
+                .unwrap()
+                .map(|x| x.unwrap().path())
+                .collect::<Vec<_>>();
+            assert!(
+                paths.is_empty(),
+                "cancelled creation left an orphan: {paths:?}"
+            );
+            std::fs::remove_dir_all(&directory).unwrap();
+        });
+    }
 
     #[tokio::test]
     async fn removing_downloads_stops_stalled_workers_and_preserves_completed_and_unrelated_files()

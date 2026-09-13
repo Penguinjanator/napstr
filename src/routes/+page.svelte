@@ -99,7 +99,9 @@
   let clearingTransfers = false;
   let removingTransfers = new Set<number>();
   let downloadGeneration = 0;
-  const pendingDownloadRequests = new Set<Promise<unknown>>();
+  const pendingDownloadRequests = new Map<Promise<unknown>, string>();
+  const downloadAttempts = new Map<string, { cancelled: boolean }>();
+  const cancellingFiles = new Set<string>();
   let advanced = false;
   let paused = false;
   let aboutOpen = false;
@@ -349,7 +351,7 @@
     return copy;
   }
 
-  function isActiveTransfer(transfer: Transfer) {
+  function isActiveTransfer(transfer: Pick<Transfer, 'progress' | 'status'>) {
     return transfer.progress < 100 && !/^(Failed|Cancelled|Refused|All seeders refused)/.test(transfer.status);
   }
 
@@ -1475,15 +1477,15 @@
   }
 
   async function requestNetworkDownload(args: Record<string, unknown>) {
-    if (clearingTransfers) throw new Error('Downloads are being cleared');
+    if (clearingTransfers || cancellingFiles.has(String(args.fileId))) throw new Error('Download is being cancelled');
     const request = invoke('request_network_download', args);
-    pendingDownloadRequests.add(request);
+    pendingDownloadRequests.set(request, String(args.fileId));
     try { return await request; }
     finally { pendingDownloadRequests.delete(request); }
   }
 
   async function startDownload(target: Result | null = selected): Promise<boolean> {
-    if (!target || clearingTransfers) return false;
+    if (!target || clearingTransfers || cancellingFiles.has(target.fileId)) return false;
     const generation = downloadGeneration;
     if (target.audiobook) {
       await startAudiobookDownload(target.audiobook);
@@ -1502,6 +1504,8 @@
       const sources = target.sourceDetails ?? [];
       if (!sources.length) { activityMessage = 'No seeder is available for this file'; return false; }
       startingDownloads = new Set(startingDownloads).add(target.fileId);
+      const attempt = { cancelled: false };
+      downloadAttempts.set(target.fileId, attempt);
       transfers = [{
         id: Date.now(), fileId: target.fileId, name: target.name, size: target.size,
         speed: 'Contacting seeders…', progress: 0, status: 'Sending encrypted NIP-17 request', destination: ''
@@ -1510,18 +1514,25 @@
       activityMessage = `Racing ${candidateCount} seeder${candidateCount === 1 ? '' : 's'} for the fastest Tor connection…`;
       try {
         await requestNetworkDownload({ fileId: target.fileId, sourcePubkeys: sources.map((source) => source.pubkey) });
-        if (generation !== downloadGeneration) return false;
+        if (generation !== downloadGeneration || attempt.cancelled) return false;
         const updated = await invoke<NativeTransfer[]>('get_transfers');
-        if (generation !== downloadGeneration) return false;
+        if (generation !== downloadGeneration || attempt.cancelled) return false;
         transfers = mapTransfers(updated);
         activityMessage = 'Seeder race started · the fastest responsive source will stream the file';
         return true;
       } catch (error) {
-        if (generation !== downloadGeneration) return false;
-        try { transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers')); }
-        catch { transfers = transfers.filter((item) => item.fileId !== target.fileId); }
+        if (generation !== downloadGeneration || attempt.cancelled) return false;
+        try {
+          const updated = await invoke<NativeTransfer[]>('get_transfers');
+          if (generation !== downloadGeneration || attempt.cancelled) return false;
+          transfers = mapTransfers(updated);
+        } catch {
+          if (generation !== downloadGeneration || attempt.cancelled) return false;
+          transfers = transfers.filter((item) => item.fileId !== target.fileId);
+        }
         activityMessage = `Request failed: ${String(error)}`;
       } finally {
+        downloadAttempts.delete(target.fileId);
         const nextStarting = new Set(startingDownloads);
         nextStarting.delete(target.fileId);
         startingDownloads = nextStarting;
@@ -1807,15 +1818,38 @@
   async function removeTransfer(id: number) {
     if (clearingTransfers || removingTransfers.has(id)) return;
     const target = transfers.find((transfer) => transfer.id === id);
-    audiobookDownloads = audiobookDownloads.filter((book) => book.activeFileId !== target?.fileId);
+    const fileId = target && isActiveTransfer(target) ? target.fileId : undefined;
+    audiobookDownloads = audiobookDownloads.filter((book) => book.activeFileId !== fileId);
     removingTransfers = new Set(removingTransfers).add(id);
+    if (fileId) {
+      cancellingFiles.add(fileId);
+      const attempt = downloadAttempts.get(fileId);
+      if (attempt) attempt.cancelled = true;
+    }
+    const pending = [...pendingDownloadRequests].filter(([, file]) => file === fileId).map(([request]) => request);
+    activityMessage = 'Stopping download and cleaning partial files…';
     try {
-      if (nativeReady) await invoke('remove_transfer', { id });
-      transfers = transfers.filter((transfer) => transfer.id !== id);
+      if (nativeReady) {
+        // Optimistic UI IDs are not database IDs. Find the actual row, and
+        // drain any request still entering the backend before the final sweep.
+        const removeRows = async () => {
+          const rows = await invoke<NativeTransfer[]>('get_transfers');
+          for (const row of rows) {
+            if (row.id === id || (pending.length && fileId && row.id < 0 && row.fileId === fileId && isActiveTransfer(row))) {
+              await invoke('remove_transfer', { id: row.id });
+            }
+          }
+        };
+        await removeRows();
+        await Promise.allSettled(pending);
+        if (pending.length) await removeRows();
+      }
+      transfers = transfers.filter((transfer) => transfer.id !== id && !(pending.length && fileId && transfer.fileId === fileId && isActiveTransfer(transfer)));
       activityMessage = 'Transfer removed; completed audio kept';
     } catch (error) {
       activityMessage = `Could not remove transfer: ${String(error)}`;
     } finally {
+      if (fileId) cancellingFiles.delete(fileId);
       removingTransfers = new Set([...removingTransfers].filter((value) => value !== id));
     }
   }
@@ -1825,7 +1859,7 @@
     clearingTransfers = true;
     downloadGeneration += 1;
     audiobookDownloads = [];
-    const pending = [...pendingDownloadRequests];
+    const pending = [...pendingDownloadRequests.keys()];
     activityMessage = 'Stopping downloads and cleaning partial files…';
     try {
       if (nativeReady) {
@@ -2420,13 +2454,13 @@
               <h2>Pair Napstrfy</h2>
               <div class="pairing-tabs" role="tablist" aria-label="Pairing access">
                 {#each [false, true] as streamOnly}
-                  <button type="button" role="tab" id={`pairing-tab-${streamOnly ? 'stream' : 'full'}`} aria-controls={`pairing-panel-${streamOnly ? 'stream' : 'full'}`} aria-selected={mobileStreamOnly === streamOnly} tabindex={mobileStreamOnly === streamOnly ? 0 : -1} onclick={() => (mobileStreamOnly = streamOnly)} onkeydown={navigatePairingTabs}>{streamOnly ? 'Read only' : 'Full access'}</button>
+                  <button type="button" role="tab" id={`pairing-tab-${streamOnly ? 'stream' : 'full'}`} aria-controls={`pairing-panel-${streamOnly ? 'stream' : 'full'}`} aria-selected={mobileStreamOnly === streamOnly} tabindex={mobileStreamOnly === streamOnly ? 0 : -1} onclick={() => (mobileStreamOnly = streamOnly)} onkeydown={navigatePairingTabs}>{streamOnly ? 'uncle jim' : 'Full access'}</button>
                 {/each}
               </div>
             {#each [false, true] as streamOnly}
               {@const offer = streamOnly ? mobileStreamPairing : mobilePairing}
               <div role="tabpanel" id={`pairing-panel-${streamOnly ? 'stream' : 'full'}`} aria-labelledby={`pairing-tab-${streamOnly ? 'stream' : 'full'}`} hidden={mobileStreamOnly !== streamOnly} tabindex="0">
-                <p>{streamOnly ? 'Listen to and cache your local music and audiobooks on this phone. This phone cannot ask Napstr to download new songs.' : 'Browse, listen, save songs for offline listening, and ask Napstr to download tracks over Tor.'}</p>
+                <p>{streamOnly ? 'Read-only, listen to and cache your local music and audiobooks. The connection cannot ask Napstr to download new songs.' : 'Browse, listen, save songs for offline listening, and ask Napstr to download tracks over Tor.'}</p>
                 <p>Scan in <a href="https://napstr.net/napstrfy.html" onclick={openNapstrfyWebsite}>Napstrfy</a>. Keep Napstr open while streaming.</p>
                 {#if offer}
                   <div class="pairing-qr" aria-label={streamOnly ? 'Read-only Napstrfy pairing QR code' : 'Full-access Napstrfy pairing QR code'}>{@html offer.qrSvg}</div>

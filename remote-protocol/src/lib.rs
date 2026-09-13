@@ -5,7 +5,6 @@ pub const ALPN: &[u8] = b"/napstr/mobile/1";
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_PAGE_SIZE: usize = 200;
-pub const MAX_STREAM_CHUNK_BYTES: u64 = 1024 * 1024;
 const PAIRING_URI_PREFIX: &str = "napstrfy://pair/";
 const LEGACY_PAIRING_URI_PREFIX: &str = "nostrfy://pair/";
 
@@ -117,8 +116,6 @@ pub enum ClientRequest {
     Pair {
         token: String,
         device_name: String,
-        #[serde(default)]
-        supports_streaming: bool,
     },
     Library {
         query: String,
@@ -148,11 +145,6 @@ pub enum ClientRequest {
     Transfers,
     FetchAudio {
         file_id: String,
-    },
-    StreamAudio {
-        file_id: String,
-        offset: u64,
-        length: u64,
     },
     Available {
         file_ids: Vec<String>,
@@ -244,8 +236,7 @@ mod tests {
             .unwrap(),
             ClientRequest::Pair {
                 token: "secret".into(),
-                device_name: "Old phone".into(),
-                supports_streaming: false
+                device_name: "Old phone".into()
             }
         );
     }

@@ -1365,7 +1365,6 @@ impl RemoteClient {
                 ClientRequest::Pair {
                     token: ticket.token,
                     device_name: clean_device_name(device_name),
-                    supports_streaming: true,
                 },
             ),
         )

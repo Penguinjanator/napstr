@@ -132,6 +132,7 @@
   let mobileStatusValue: MobileStatus | null = null;
   let mobilePairing: MobilePairingOffer | null = null;
   let mobileStreamPairing: MobilePairingOffer | null = null;
+  let mobileStreamOnly = false;
   let mobileLoading = false;
   let mobileStatusPending = false;
   let mobileError = '';
@@ -896,9 +897,17 @@
   }
 
   async function openMobileConnect() {
+    mobileStreamOnly = false;
     await refreshMobileStatus();
     if (!mobilePairing) await createMobilePairing();
     if (!mobileStreamPairing) await createMobilePairing(true);
+  }
+
+  function navigatePairingTabs(event: KeyboardEvent) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    mobileStreamOnly = event.key === 'Home' ? false : event.key === 'End' ? true : !mobileStreamOnly;
+    document.getElementById(`pairing-tab-${mobileStreamOnly ? 'stream' : 'full'}`)?.focus();
   }
 
   async function refreshMobileStatus() {
@@ -2351,10 +2360,16 @@
           </div>
           {#if mobileError}<div class="trollbox-error">{mobileError}</div>{/if}
           <div class="mobile-connect-grid">
+            <section class="pair-phone-card">
+              <h2>Pair Napstrfy</h2>
+              <div class="pairing-tabs" role="tablist" aria-label="Pairing access">
+                {#each [false, true] as streamOnly}
+                  <button type="button" role="tab" id={`pairing-tab-${streamOnly ? 'stream' : 'full'}`} aria-controls={`pairing-panel-${streamOnly ? 'stream' : 'full'}`} aria-selected={mobileStreamOnly === streamOnly} tabindex={mobileStreamOnly === streamOnly ? 0 : -1} onclick={() => (mobileStreamOnly = streamOnly)} onkeydown={navigatePairingTabs}>{streamOnly ? 'Stream only' : 'Full access'}</button>
+                {/each}
+              </div>
             {#each [false, true] as streamOnly}
               {@const offer = streamOnly ? mobileStreamPairing : mobilePairing}
-              <section class="pair-phone-card">
-                <h2>{streamOnly ? 'Stream only · read only' : 'Pair Napstrfy · full access'}</h2>
+              <div role="tabpanel" id={`pairing-panel-${streamOnly ? 'stream' : 'full'}`} aria-labelledby={`pairing-tab-${streamOnly ? 'stream' : 'full'}`} hidden={mobileStreamOnly !== streamOnly} tabindex="0">
                 <p>{streamOnly ? 'Share your local music and audiobooks for listening. This phone cannot request downloads or save songs for offline listening.' : 'Browse, listen, save songs for offline listening, and ask Napstr to download tracks over Tor.'}</p>
                 <p>Scan in <a href="https://napstr.net/napstrfy.html" onclick={openNapstrfyWebsite}>Napstrfy</a>. Keep Napstr open while streaming.</p>
                 {#if offer}
@@ -2367,8 +2382,9 @@
                   <div class="pairing-placeholder"><span>▦</span><b>Your one-use QR code will appear here</b></div>
                 {/if}
                 {#if streamOnly}<p>Streaming listeners can still record the audio they receive.</p>{/if}
-              </section>
+              </div>
             {/each}
+            </section>
             <section class="paired-devices-card">
               <p>Napstrfy creates a private, encrypted tunnel from your phone to Napstr, letting you listen to your catalogue by connecting directly to your Napstr instance. Only for your own use and for people you trust.</p>
               <h2>Paired phones</h2>

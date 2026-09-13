@@ -502,7 +502,7 @@
           ? (playerIndex + 1) % playerQueue.length
           : -1;
       const next = nextIndex >= 0 ? playerQueue[nextIndex] : undefined;
-      if (next?.local && !status.streamOnly) {
+      if (next?.local) {
         void invoke('prefetch_remote_audio', {
           afterFileId: cached.track.fileId,
           track: next,
@@ -531,7 +531,7 @@
     audiobookId: string | null = null
   ) {
     if (status.streamOnly) {
-      error = 'This pairing allows streaming only. Downloads are disabled.';
+      error = 'This pairing is read only. It cannot ask Napstr to download songs.';
       return;
     }
     if (pending.has(track.fileId)) return;
@@ -1045,7 +1045,7 @@
     <header class="mobile-header">
       <div class="brand"><img src="/napstr-logo-small.png" alt="" /><b>napstrfy</b></div>
       {#if status.paired}
-        <button class="desktop-status" class:offline={!status.connected} onclick={reconnect}><i></i><span>{statusPending ? 'Connecting…' : status.connected ? status.desktopName || 'Napstr connected' : 'Reconnect'}{status.streamOnly ? ' · Stream only' : ''}</span></button>
+        <button class="desktop-status" class:offline={!status.connected} onclick={reconnect}><i></i><span>{statusPending ? 'Connecting…' : status.connected ? status.desktopName || 'Napstr connected' : 'Reconnect'}{status.streamOnly ? ' · Read only' : ''}</span></button>
       {:else}
         <button class="desktop-status offline" onclick={() => (activeTab = 'music')}><i></i><span>Pair Napstr for music</span></button>
       {/if}

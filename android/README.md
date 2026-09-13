@@ -59,14 +59,14 @@ npm run android:build -- --debug --apk
 adb install -r src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
 ```
 
-Pair the phone from Napstr's **Mobile** page. Napstr must remain running while Napstrfy is in use.
+Pair the phone from Napstr's **Mobile** page. Napstr must remain running to browse or fetch its audio; songs already cached on the phone can play offline.
 
 The Mobile page offers two independent, one-use QR codes:
 
 - **Full access** keeps the usual library search, Tor download requests, and verified offline audio cache.
-- **Stream only · read only** lets a phone browse and play music and audiobooks already on this Napstr. Napstr rejects download requests and full-file cache transfers. Napstrfy plays bounded audio ranges from memory, supports seeking, and skips offline caching and prefetching. Both apps need this feature installed; an older Napstrfy will be asked to update.
+- **Read only** lets a phone browse, play, and cache music and audiobooks already on this Napstr. Playback uses the same verified offline audio cache, seeking, and next-track prefetching as full access. Napstr rejects requests to download new songs on the host and access its transfer history. Update both apps to get this playback behaviour.
 
-Each code expires after five minutes. Generating a replacement affects only that code's access mode. Each paired phone shows its access level; pairing the same phone again changes its access. Removing a phone rejects subsequent requests, including the next streaming range. Already buffered audio can finish playing. Streaming cannot prevent someone from recording or saving the audio with a modified client.
+Each code expires after five minutes. Generating a replacement affects only that code's access mode. Each paired phone shows its access level; pairing the same phone again changes its access. Removing a phone rejects subsequent requests and stops active audio transfers at the next chunk check. Audio already cached on the phone remains available offline. Read-only access protects the host from download requests; it does not restrict copying audio.
 
 Podcasts are independent of Napstr: Napstrfy searches a public podcast directory and streams or downloads episodes directly from their publishers.
 

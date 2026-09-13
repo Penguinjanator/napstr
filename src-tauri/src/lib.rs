@@ -270,6 +270,7 @@ fn initialise_database(path: &Path, app_data: &Path) -> Result<(), String> {
              DELETE FROM transfers WHERE status='Verified · Complete';",
         )
         .map_err(|error| error.to_string())?;
+    network::queue_interrupted_downloads(&connection)?;
 
     let downloads_path = app_data.join("Downloads");
     fs::create_dir_all(&downloads_path).map_err(|error| error.to_string())?;
@@ -2107,6 +2108,7 @@ fn toggle_maximise(window: tauri::Window) -> Result<(), String> {
 #[tauri::command]
 async fn close_window(window: tauri::Window, state: State<'_, AppState>) -> Result<(), String> {
     state.network.stop().await;
+    state.network.preserve_interrupted_downloads()?;
     state.tor.stop().await;
     state.mobile.stop().await;
     window.close().map_err(|error| error.to_string())
@@ -2149,6 +2151,11 @@ pub fn run() {
                 .and_then(|connection| get_setting(&connection, "shared_folder").ok())
                 .map(PathBuf::from);
             let startup_folder = existing_folder.clone();
+            if let Some(folder) = &startup_folder {
+                if let Err(error) = transfer::cleanup_abandoned_downloads(folder) {
+                    eprintln!("Could not clean abandoned temporary downloads: {error}");
+                }
+            }
             let watcher = existing_folder.and_then(|folder| {
                 if !folder.is_dir() {
                     if let Ok(connection) = open_connection(&db_path) {
@@ -2262,6 +2269,11 @@ pub fn run() {
     {
         tauri::async_runtime::block_on(async move {
             services.network.stop().await;
+            // Rotate pending requests before stopping Tor, so old workers cannot
+            // turn a normal application exit into a permanent failed download.
+            if let Err(error) = services.network.preserve_interrupted_downloads() {
+                eprintln!("Could not preserve interrupted downloads: {error}");
+            }
             services.tor.stop().await;
             services.mobile.stop().await;
         });

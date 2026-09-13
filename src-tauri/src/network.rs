@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -32,6 +32,9 @@ const TRANSFERS_CHANGED_EVENT: &str = "napstr-transfers-changed";
 const TROLLBOX_CACHE_LIMIT: usize = 200;
 const LIVE_NOSTR_EVENT_LIMIT: usize = 35_000;
 const MAX_SEEDER_CANDIDATES: usize = 3;
+const DOWNLOAD_RESTART_PENDING: &str = "Waiting to restart after reconnect";
+const DOWNLOAD_RESTART_REQUESTED: &str = "Restarting · requesting fresh Tor seeders";
+const DOWNLOAD_RESTART_OFFER_TIMEOUT: Duration = Duration::from_secs(120);
 const CATALOGUE_EVENT_PACE: Duration = Duration::from_millis(75);
 const AVAILABILITY_QUERY_LIMIT: usize = 1_000;
 const AVAILABILITY_FILE_LIMIT: usize = 50_000;
@@ -596,6 +599,7 @@ pub struct NetworkService {
     availability_fetch_lock: Mutex<()>,
     trollbox_cache_lock: Mutex<()>,
     track_discussion_subscription_lock: Mutex<()>,
+    download_restart_lock: Mutex<()>,
     connected: AtomicBool,
     generation: AtomicU64,
     last_error: RwLock<String>,
@@ -626,6 +630,7 @@ impl NetworkService {
             availability_fetch_lock: Mutex::new(()),
             trollbox_cache_lock: Mutex::new(()),
             track_discussion_subscription_lock: Mutex::new(()),
+            download_restart_lock: Mutex::new(()),
             connected: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             last_error: RwLock::new(String::new()),
@@ -635,6 +640,10 @@ impl NetworkService {
 
     pub fn transfers(&self) -> &Arc<TransferService> {
         &self.transfers
+    }
+
+    pub fn preserve_interrupted_downloads(&self) -> Result<(), String> {
+        queue_interrupted_downloads(&super::open_connection(&self.db_path)?)
     }
 
     async fn availability_snapshot(
@@ -874,6 +883,12 @@ impl NetworkService {
             }
         });
 
+        let recovery = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = recovery.restart_interrupted_downloads().await {
+                eprintln!("Could not restart interrupted downloads: {error}");
+            }
+        });
         self.queue_catalogue_publish(true);
         let heartbeat = self.clone();
         tokio::spawn(async move {
@@ -2566,6 +2581,17 @@ impl NetworkService {
             connection.execute("INSERT INTO download_sources(request_id,source_pubkey,status,updated_at) VALUES(?1,?2,'Requested',?3)", params![request_id, source, Utc::now().to_rfc3339()]).map_err(|error| error.to_string())?;
         }
         drop(connection);
+        self.deliver_download_request(client, request_id, file_id, receivers)
+            .await
+    }
+
+    async fn deliver_download_request(
+        &self,
+        client: Client,
+        request_id: String,
+        file_id: String,
+        receivers: Vec<(String, PublicKey)>,
+    ) -> Result<String, String> {
         // A download can be requested by Napstrfy rather than by the desktop
         // UI. Wake the UI immediately so it discovers the new database row and
         // starts its normal high-frequency progress polling.
@@ -2611,6 +2637,56 @@ impl NetworkService {
             return Err("NIP-17 request could not be delivered to any seeder".into());
         }
         Ok(request_id)
+    }
+
+    async fn restart_interrupted_downloads(&self) -> Result<(), String> {
+        let _guard = self.download_restart_lock.lock().await;
+        let pending = {
+            let connection = super::open_connection(&self.db_path)?;
+            let mut statement = connection.prepare(
+                "SELECT request_id,file_id FROM network_downloads WHERE status=?1 ORDER BY rowid"
+            ).map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([DOWNLOAD_RESTART_PENDING], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        for (request_id, file_id) in pending {
+            let Some(client) = self.client.read().await.clone() else {
+                break;
+            };
+            let receivers = claim_download_restart(&self.db_path, &request_id, &file_id)?;
+            let Some(receivers) = receivers else {
+                continue;
+            };
+            let tor = self.transfers.clone();
+            tokio::spawn(async move {
+                let _ = tor.warm_tor().await;
+            });
+            // Fresh negotiation, with the same Tor-only transfer implementation.
+            // A failed delivery is recorded by the shared request path; keep processing the queue.
+            if self
+                .deliver_download_request(client, request_id.clone(), file_id, receivers)
+                .await
+                .is_ok()
+            {
+                let db_path = self.db_path.clone();
+                let app_handle = self.app_handle.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(DOWNLOAD_RESTART_OFFER_TIMEOUT).await;
+                    if let Ok(connection) = super::open_connection(&db_path) {
+                        if remove_unavailable_restart(&connection, &request_id).unwrap_or(false) {
+                            let _ = app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
+                        }
+                    }
+                });
+            }
+        }
+        let _ = self.app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
+        Ok(())
     }
 
     pub async fn report_catalogue(
@@ -2732,15 +2808,18 @@ impl NetworkService {
             SignalMessage::DownloadRefused {
                 protocol,
                 request_id,
+                file_id,
                 reason,
-                ..
             } if protocol == "napstr/1" => {
                 let connection = super::open_connection(&self.db_path)?;
-                connection.execute("UPDATE download_sources SET status=?1,updated_at=?2 WHERE request_id=?3 AND source_pubkey=?4", params![format!("Refused: {reason}"), Utc::now().to_rfc3339(), request_id, sender.to_hex()]).map_err(|error| error.to_string())?;
-                let pending: i64 = connection.query_row("SELECT count(*) FROM download_sources WHERE request_id=?1 AND status IN ('Requested','Connected')", [&request_id], |row| row.get(0)).map_err(|error| error.to_string())?;
-                if pending == 0 {
-                    connection.execute("UPDATE network_downloads SET status='All seeders refused',updated_at=?1 WHERE request_id=?2", params![Utc::now().to_rfc3339(), request_id]).map_err(|error| error.to_string())?;
-                }
+                record_download_refusal(
+                    &connection,
+                    &request_id,
+                    &file_id,
+                    &sender.to_hex(),
+                    &reason,
+                )?;
+                let _ = self.app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
             }
             _ => return Err("unsupported Napstr signal".into()),
         }
@@ -2957,6 +3036,243 @@ fn relay_failure(label: &str, failures: &HashMap<RelayUrl, String>) -> String {
         .map(String::as_str)
         .unwrap_or("the relay did not accept the event");
     format!("{label}: {details}")
+}
+
+pub fn queue_interrupted_downloads(connection: &Connection) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let interrupted = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT request_id,source_pubkey FROM network_downloads
+             WHERE status != 'Verified · Complete' AND status != 'Cancelled'
+               AND status NOT LIKE 'Failed%' AND status NOT LIKE 'Refused%'
+               AND status NOT LIKE 'All seeders refused%' ORDER BY rowid",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+    };
+    for (previous_id, primary_source) in interrupted {
+        let mut sources = {
+            let mut statement = transaction
+                .prepare("SELECT source_pubkey FROM download_sources WHERE request_id=?1")
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([&previous_id], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        if sources.is_empty() {
+            sources.push(primary_source);
+        }
+        // Keep the transfer row/order and audiobook destination, but discard
+        // old session IDs and onion addresses: only newly negotiated offers may run.
+        let request_id = Uuid::new_v4().to_string();
+        transaction
+            .execute(
+                "DELETE FROM download_sources WHERE request_id=?1",
+                [&previous_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE network_downloads SET request_id=?1,progress=0,status=?2,speed='—',
+             destination='',onion='',updated_at=?3 WHERE request_id=?4",
+                params![
+                    request_id,
+                    DOWNLOAD_RESTART_PENDING,
+                    Utc::now().to_rfc3339(),
+                    previous_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        for source in sources {
+            transaction.execute(
+                "INSERT INTO download_sources(request_id,source_pubkey,status,updated_at) VALUES(?1,?2,'Pending restart',?3)",
+                params![request_id, source, Utc::now().to_rfc3339()],
+            ).map_err(|error| error.to_string())?;
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+// Only remove recovery requests that never started a transfer. An accepted
+// offer, a cancellation, or a transport failure must not be mistaken for a
+// missing song. Deleting both rows also makes late offers harmless.
+fn remove_unavailable_restart(connection: &Connection, request_id: &str) -> Result<bool, String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let removed = transaction
+        .execute(
+            "DELETE FROM network_downloads WHERE request_id=?1 AND status=?2
+         AND NOT EXISTS (SELECT 1 FROM download_sources WHERE request_id=?1
+           AND status NOT IN ('Requested','Pending restart')
+           AND status NOT LIKE 'Refused:%' AND status NOT LIKE 'Failed:%')",
+            params![request_id, DOWNLOAD_RESTART_REQUESTED],
+        )
+        .map_err(|error| error.to_string())?;
+    if removed > 0 {
+        transaction
+            .execute(
+                "DELETE FROM download_sources WHERE request_id=?1",
+                [request_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(removed > 0)
+}
+
+fn record_download_refusal(
+    connection: &Connection,
+    request_id: &str,
+    file_id: &str,
+    source: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let changed = connection
+        .execute(
+            "UPDATE download_sources SET status=?1,updated_at=?2
+         WHERE request_id=?3 AND source_pubkey=?4 AND status='Requested'
+         AND EXISTS (SELECT 1 FROM network_downloads WHERE request_id=?3 AND file_id=?5)",
+            params![
+                format!("Refused: {reason}"),
+                Utc::now().to_rfc3339(),
+                request_id,
+                source,
+                file_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Ok(());
+    }
+    let pending: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM download_sources WHERE request_id=?1
+         AND status NOT LIKE 'Refused:%' AND status NOT LIKE 'Failed:%')",
+            [request_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !pending && !remove_unavailable_restart(connection, request_id)? {
+        connection.execute(
+            "UPDATE network_downloads SET status='All seeders refused',updated_at=?1 WHERE request_id=?2",
+            params![Utc::now().to_rfc3339(), request_id],
+        ).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn claim_download_restart(
+    db_path: &Path,
+    request_id: &str,
+    file_id: &str,
+) -> Result<Option<Vec<(String, PublicKey)>>, String> {
+    let connection = super::open_connection(db_path)?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let pending: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM network_downloads WHERE request_id=?1 AND file_id=?2 AND status=?3)",
+        params![request_id, file_id, DOWNLOAD_RESTART_PENDING], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if !pending {
+        return Ok(None);
+    }
+    let local: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE file_id=?1)",
+            [file_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if local {
+        transaction
+            .execute(
+                "DELETE FROM download_sources WHERE request_id=?1",
+                [request_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM network_downloads WHERE request_id=?1",
+                [request_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        return Ok(None);
+    }
+    let blocked: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM blocked_files WHERE file_id=?1)",
+            [file_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let receivers = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT source_pubkey FROM download_sources WHERE request_id=?1
+             AND source_pubkey NOT IN (SELECT pubkey FROM blocked_pubkeys) ORDER BY source_pubkey",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([request_id], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter_map(|source| PublicKey::from_str(&source).ok().map(|key| (source, key)))
+            .take(MAX_SEEDER_CANDIDATES)
+            .collect::<Vec<_>>()
+    };
+    let status = if blocked || !valid_file_id(file_id) {
+        "Failed: interrupted download is blocked or invalid"
+    } else {
+        DOWNLOAD_RESTART_REQUESTED
+    };
+    if receivers.is_empty() && !status.starts_with("Failed") {
+        transaction
+            .execute(
+                "DELETE FROM download_sources WHERE request_id=?1",
+                [request_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM network_downloads WHERE request_id=?1",
+                [request_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        return Ok(None);
+    }
+    if !status.starts_with("Failed") {
+        for (source, _) in &receivers {
+            transaction.execute(
+                "UPDATE download_sources SET status='Requested',updated_at=?1 WHERE request_id=?2 AND source_pubkey=?3",
+                params![Utc::now().to_rfc3339(), request_id, source],
+            ).map_err(|error| error.to_string())?;
+        }
+    }
+    transaction
+        .execute(
+            "UPDATE network_downloads SET status=?1,updated_at=?2 WHERE request_id=?3",
+            params![status, Utc::now().to_rfc3339(), request_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok((!status.starts_with("Failed")).then_some(receivers))
 }
 
 pub fn initialise_network_schema(connection: &Connection) -> Result<(), String> {
@@ -3310,6 +3626,330 @@ fn mime_for_format(format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn insert_interrupted_download(
+        connection: &Connection,
+        id: &str,
+        status: &str,
+        source: &str,
+    ) -> String {
+        let file_id = hex::encode(Sha256::digest(id.as_bytes()));
+        connection.execute(
+            "INSERT INTO network_downloads(request_id,file_id,source_pubkey,filename,size,progress,status,speed,destination,onion,updated_at,destination_folder)
+             VALUES(?1,?2,?3,'chapter.flac',1000,38,?4,'117 KB/s','old-partial','old.onion','then','Audiobooks/My Book')",
+            params![id, file_id, source, status],
+        ).unwrap();
+        connection
+            .execute(
+                "INSERT INTO download_sources VALUES(?1,?2,'Connected','then')",
+                params![id, source],
+            )
+            .unwrap();
+        file_id
+    }
+
+    #[test]
+    fn reopening_requeues_interrupted_downloads_with_fresh_sessions_and_preserves_terminal_rows() {
+        let directory = std::env::temp_dir().join(format!("napstr-restart-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db, &directory).unwrap();
+        let connection = super::super::open_connection(&db).unwrap();
+        let source = Keys::generate().public_key().to_hex();
+        let file_id = insert_interrupted_download(
+            &connection,
+            "partial",
+            "Downloading from fastest responsive Tor seeder",
+            &source,
+        );
+        let rowid: i64 = connection
+            .query_row(
+                "SELECT rowid FROM network_downloads WHERE request_id='partial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for (id, status) in [
+            ("queued", "Racing responsive Tor seeders"),
+            ("failed", "Failed: checksum mismatch"),
+            ("cancelled", "Cancelled"),
+            ("refused", "All seeders refused"),
+            ("complete", "Verified · Complete"),
+        ] {
+            insert_interrupted_download(&connection, id, status, &source);
+        }
+        crate::initialise_database(&db, &directory).unwrap();
+        let (request_id, progress, status, speed, destination, onion, folder): (String, f64, String, String, String, String, String) = connection.query_row(
+            "SELECT request_id,progress,status,speed,destination,onion,destination_folder FROM network_downloads WHERE rowid=?1",
+            [rowid], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        ).unwrap();
+        assert_ne!(request_id, "partial");
+        assert_eq!(progress, 0.0);
+        assert_eq!(status, DOWNLOAD_RESTART_PENDING);
+        assert_eq!(speed, "—");
+        assert!(destination.is_empty() && onion.is_empty());
+        assert_eq!(folder, "Audiobooks/My Book");
+        assert_eq!(connection.query_row("SELECT count(*) FROM download_sources WHERE request_id IN ('partial','queued','complete')", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(connection.query_row("SELECT count(*) FROM network_downloads WHERE request_id IN ('failed','cancelled','refused') AND progress=38", [], |row| row.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM network_downloads WHERE status=?1",
+                    [DOWNLOAD_RESTART_PENDING],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        let receivers = claim_download_restart(&db, &request_id, &file_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receivers.len(), 1);
+        assert_eq!(receivers[0].0, source);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM download_sources WHERE request_id=?1 AND source_pubkey=?2",
+                    params![request_id, source],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "Requested"
+        );
+        assert!(claim_download_restart(&db, &request_id, &file_id)
+            .unwrap()
+            .is_none());
+        assert!(claim_download_restart(&db, "partial", &file_id)
+            .unwrap()
+            .is_none());
+        queue_interrupted_downloads(&connection).unwrap();
+        // Old workers finishing during shutdown cannot overwrite the recovered row.
+        assert_eq!(connection.execute(
+            "UPDATE network_downloads SET status='Failed: connection closed' WHERE request_id=?1",
+            [&request_id],
+        ).unwrap(), 0);
+        let next_id: String = connection
+            .query_row(
+                "SELECT request_id FROM network_downloads WHERE rowid=?1",
+                [rowid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(next_id, request_id);
+        assert!(claim_download_restart(&db, &next_id, &file_id)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM network_downloads", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn restart_skips_blocked_local_and_removed_downloads() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-restart-permissions-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db, &directory).unwrap();
+        let connection = super::super::open_connection(&db).unwrap();
+        let source = Keys::generate().public_key().to_hex();
+        let blocked_source = Keys::generate().public_key().to_hex();
+        let blocked_file = insert_interrupted_download(
+            &connection,
+            "blocked-file",
+            DOWNLOAD_RESTART_PENDING,
+            &source,
+        );
+        let local_file =
+            insert_interrupted_download(&connection, "local", DOWNLOAD_RESTART_PENDING, &source);
+        let no_sources = insert_interrupted_download(
+            &connection,
+            "blocked-source",
+            DOWNLOAD_RESTART_PENDING,
+            &blocked_source,
+        );
+        let mixed =
+            insert_interrupted_download(&connection, "mixed", DOWNLOAD_RESTART_PENDING, &source);
+        connection
+            .execute(
+                "INSERT INTO download_sources VALUES('mixed',?1,'Requested','then')",
+                [&blocked_source],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO blocked_pubkeys VALUES(?1,'test','now')",
+                [&blocked_source],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO blocked_files VALUES(?1,'test','now')",
+                [&blocked_file],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO files(file_id,filename,path,size,format,indexed_at) VALUES(?1,'chapter.flac','local.flac',1000,'FLAC','now')", [&local_file]).unwrap();
+        assert!(claim_download_restart(&db, "blocked-file", &blocked_file)
+            .unwrap()
+            .is_none());
+        assert!(claim_download_restart(&db, "blocked-source", &no_sources)
+            .unwrap()
+            .is_none());
+        assert!(claim_download_restart(&db, "local", &local_file)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM network_downloads WHERE request_id='local'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(claim_download_restart(&db, "removed", &local_file)
+            .unwrap()
+            .is_none());
+        let receivers = claim_download_restart(&db, "mixed", &mixed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receivers.len(), 1);
+        assert_eq!(receivers[0].0, source);
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn unavailable_restarts_are_removed_without_removing_active_or_terminal_downloads() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-restart-expiry-{}", Uuid::new_v4()));
+        let db = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db, &directory).unwrap();
+        let connection = super::super::open_connection(&db).unwrap();
+        let source = Keys::generate().public_key().to_hex();
+        for (id, status, source_status, should_remove) in [
+            ("silent", DOWNLOAD_RESTART_REQUESTED, "Requested", true),
+            (
+                "refused",
+                DOWNLOAD_RESTART_REQUESTED,
+                "Refused: file missing",
+                true,
+            ),
+            ("offered", DOWNLOAD_RESTART_REQUESTED, "Connected", false),
+            (
+                "racing",
+                DOWNLOAD_RESTART_REQUESTED,
+                "Racing Tor connection",
+                false,
+            ),
+            ("active", "Downloading over Tor", "Requested", false),
+            ("cancelled", "Cancelled", "Requested", false),
+            (
+                "delivery-failed",
+                "Failed: NIP-17 request could not be delivered",
+                "Failed: offline",
+                false,
+            ),
+            (
+                "pending",
+                DOWNLOAD_RESTART_PENDING,
+                "Pending restart",
+                false,
+            ),
+            ("new", "Racing responsive Tor seeders", "Requested", false),
+        ] {
+            insert_interrupted_download(&connection, id, status, &source);
+            connection
+                .execute(
+                    "UPDATE download_sources SET status=?1 WHERE request_id=?2",
+                    params![source_status, id],
+                )
+                .unwrap();
+            assert_eq!(
+                remove_unavailable_restart(&connection, id).unwrap(),
+                should_remove,
+                "{id}"
+            );
+            let count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM download_sources WHERE request_id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, if should_remove { 0 } else { 1 }, "{id}");
+        }
+        assert!(!remove_unavailable_restart(&connection, "already-removed").unwrap());
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn restarted_download_waits_for_all_requested_seeders_to_refuse() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-restart-refusal-{}", Uuid::new_v4()));
+        let db = directory.join("napstr.sqlite3");
+        crate::initialise_database(&db, &directory).unwrap();
+        let connection = super::super::open_connection(&db).unwrap();
+        let source = Keys::generate().public_key().to_hex();
+        let other = Keys::generate().public_key().to_hex();
+        let file_id =
+            insert_interrupted_download(&connection, "retry", DOWNLOAD_RESTART_PENDING, &source);
+        connection
+            .execute(
+                "INSERT INTO download_sources VALUES('retry',?1,'Pending restart','then')",
+                [&other],
+            )
+            .unwrap();
+        claim_download_restart(&db, "retry", &file_id)
+            .unwrap()
+            .unwrap();
+        record_download_refusal(&connection, "retry", &file_id, "unrequested", "missing").unwrap();
+        record_download_refusal(&connection, "retry", &"a".repeat(64), &source, "wrong file")
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM download_sources WHERE status='Requested'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+        record_download_refusal(&connection, "retry", &file_id, &source, "missing").unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM network_downloads", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        record_download_refusal(&connection, "retry", &file_id, &other, "missing").unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM network_downloads", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM download_sources", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn user_catalogue_filters_keep_shared_hashes_without_other_publishers() {

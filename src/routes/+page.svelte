@@ -2364,24 +2364,23 @@
               <h2>Pair Napstrfy</h2>
               <div class="pairing-tabs" role="tablist" aria-label="Pairing access">
                 {#each [false, true] as streamOnly}
-                  <button type="button" role="tab" id={`pairing-tab-${streamOnly ? 'stream' : 'full'}`} aria-controls={`pairing-panel-${streamOnly ? 'stream' : 'full'}`} aria-selected={mobileStreamOnly === streamOnly} tabindex={mobileStreamOnly === streamOnly ? 0 : -1} onclick={() => (mobileStreamOnly = streamOnly)} onkeydown={navigatePairingTabs}>{streamOnly ? 'Stream only' : 'Full access'}</button>
+                  <button type="button" role="tab" id={`pairing-tab-${streamOnly ? 'stream' : 'full'}`} aria-controls={`pairing-panel-${streamOnly ? 'stream' : 'full'}`} aria-selected={mobileStreamOnly === streamOnly} tabindex={mobileStreamOnly === streamOnly ? 0 : -1} onclick={() => (mobileStreamOnly = streamOnly)} onkeydown={navigatePairingTabs}>{streamOnly ? 'Read only' : 'Full access'}</button>
                 {/each}
               </div>
             {#each [false, true] as streamOnly}
               {@const offer = streamOnly ? mobileStreamPairing : mobilePairing}
               <div role="tabpanel" id={`pairing-panel-${streamOnly ? 'stream' : 'full'}`} aria-labelledby={`pairing-tab-${streamOnly ? 'stream' : 'full'}`} hidden={mobileStreamOnly !== streamOnly} tabindex="0">
-                <p>{streamOnly ? 'Share your local music and audiobooks for listening. This phone cannot request downloads or save songs for offline listening.' : 'Browse, listen, save songs for offline listening, and ask Napstr to download tracks over Tor.'}</p>
+                <p>{streamOnly ? 'Listen to and cache your local music and audiobooks on this phone. This phone cannot ask Napstr to download new songs.' : 'Browse, listen, save songs for offline listening, and ask Napstr to download tracks over Tor.'}</p>
                 <p>Scan in <a href="https://napstr.net/napstrfy.html" onclick={openNapstrfyWebsite}>Napstrfy</a>. Keep Napstr open while streaming.</p>
                 {#if offer}
-                  <div class="pairing-qr" aria-label={streamOnly ? 'Stream-only Napstrfy pairing QR code' : 'Full-access Napstrfy pairing QR code'}>{@html offer.qrSvg}</div>
+                  <div class="pairing-qr" aria-label={streamOnly ? 'Read-only Napstrfy pairing QR code' : 'Full-access Napstrfy pairing QR code'}>{@html offer.qrSvg}</div>
                   <p class="pairing-expiry">One use · expires {new Date(offer.expiresAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
-                  <details><summary>Pair without a camera</summary><textarea readonly value={offer.ticket} aria-label={streamOnly ? 'Manual stream-only pairing code' : 'Manual full-access pairing code'}></textarea></details>
+                  <details><summary>Pair without a camera</summary><textarea readonly value={offer.ticket} aria-label={streamOnly ? 'Manual read-only pairing code' : 'Manual full-access pairing code'}></textarea></details>
                   <button class="classic-button" onclick={() => createMobilePairing(streamOnly)} disabled={mobileLoading}>{mobileLoading ? 'Preparing…' : 'Create a new code'}</button>
                 {:else}
                   <button class="classic-button primary" onclick={() => createMobilePairing(streamOnly)} disabled={mobileLoading}>{mobileLoading ? 'Preparing Iroh…' : 'Create pairing code'}</button>
                   <div class="pairing-placeholder"><span>▦</span><b>Your one-use QR code will appear here</b></div>
                 {/if}
-                {#if streamOnly}<p>Streaming listeners can still record the audio they receive.</p>{/if}
               </div>
             {/each}
             </section>
@@ -2393,7 +2392,7 @@
                 {#each mobileStatusValue?.devices ?? [] as device (device.endpointId)}
                   <div class="paired-device">
                     <span class="phone-glyph">▯</span>
-                    <div><b>{device.name}</b><small>{device.streamOnly ? 'Stream only' : 'Full access'}</small><small>Last connected {mobileLastSeen(device.lastSeen)}</small><code title={device.endpointId}>{device.endpointId}</code></div>
+                    <div><b>{device.name}</b><small>{device.streamOnly ? 'Read only' : 'Full access'}</small><small>Last connected {mobileLastSeen(device.lastSeen)}</small><code title={device.endpointId}>{device.endpointId}</code></div>
                     <button class="classic-button" onclick={() => revokeMobileDevice(device)}>Remove</button>
                   </div>
                 {/each}
@@ -2413,7 +2412,7 @@
       {:else}
         <section class="full-panel settings-view">
           <div class="panel-title"><span></span><b>Napstr Settings</b><span></span></div>
-          <fieldset><legend>Network</legend><label><input type="checkbox" checked disabled /> Connect automatically at startup</label><label><input type="checkbox" checked disabled /> Never allow direct-IP file transfer</label><label>Nostr relays <input bind:value={nostrRelays} /></label><label>Tor <input value="Bundled, managed automatically" readonly /></label></fieldset>
+          <fieldset><legend>Network</legend><label><input type="checkbox" checked disabled /> Connect automatically at startup</label><label>Nostr relays <input bind:value={nostrRelays} /></label><label>Tor <input value="Bundled, managed automatically" readonly /></label></fieldset>
           <fieldset><legend>Files</legend><label>Downloads and shared audio <input value={napstrFolder} readonly /><button class="classic-button" onclick={chooseNapstrFolder}>Browse…</button></label><label>Transfer mode <select disabled><option>Whole file</option></select></label><label><input type="checkbox" checked disabled /> Downloaded audio is automatically shared</label><label><input type="checkbox" checked disabled /> Verify the complete file with SHA-256</label></fieldset>
           <div class="settings-actions"><button class="classic-button primary" onclick={persistSettings}>OK</button><button class="classic-button" onclick={refreshSnapshot}>Cancel</button><button class="classic-button" onclick={persistSettings}>Apply</button></div>
         </section>

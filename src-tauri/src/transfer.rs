@@ -36,6 +36,69 @@ impl Drop for TemporaryPath {
     }
 }
 
+fn is_download_temporary_name(name: &str) -> bool {
+    let Some(body) = name
+        .strip_prefix(".napstr-download-")
+        .and_then(|value| value.strip_suffix(".part"))
+    else {
+        return false;
+    };
+    let (id, extension) = body.split_once('.').unwrap_or((body, ""));
+    id.len() == 36
+        && uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
+        && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// Run before starting workers/watchers. Only Napstr's temporary downloads in
+/// its actual download destinations are eligible; never follow child symlinks.
+pub fn cleanup_abandoned_downloads(folder: &Path) -> Result<(), String> {
+    fn clean(directory: &Path) -> Result<(), String> {
+        for entry in std::fs::read_dir(directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(is_download_temporary_name)
+            {
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+        Ok(())
+    }
+    if !folder.exists() {
+        return Ok(());
+    }
+    let root = std::fs::canonicalize(folder).map_err(|error| error.to_string())?;
+    clean(&root)?;
+    let books = root.join("Audiobooks");
+    match std::fs::symlink_metadata(&books) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            for entry in std::fs::read_dir(&books).map_err(|error| error.to_string())? {
+                let entry = entry.map_err(|error| error.to_string())?;
+                if entry
+                    .file_type()
+                    .map_err(|error| error.to_string())?
+                    .is_dir()
+                {
+                    clean(&entry.path())?;
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    Ok(())
+}
+
 async fn create_temporary_file(
     directory: &Path,
     prefix: &str,
@@ -961,6 +1024,61 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use tokio::io::{duplex, DuplexStream};
+
+    #[tokio::test]
+    async fn startup_cleanup_only_removes_napstr_download_partials() {
+        let directory =
+            std::env::temp_dir().join(format!("napstr-cleanup-test-{}", uuid::Uuid::new_v4()));
+        let root = directory.join("downloads");
+        let book = root.join("Audiobooks/Book");
+        let outside = directory.join("outside");
+        std::fs::create_dir_all(&book).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut abandoned = Vec::new();
+        for destination in [&root, &book] {
+            let (file, guard) =
+                create_temporary_file(destination, "napstr-download", Path::new("song.flac"))
+                    .await
+                    .unwrap();
+            abandoned.push(guard.path.clone());
+            drop(file);
+            std::mem::forget(guard); // Simulate process exit without destructors.
+        }
+        let mut retained = Vec::new();
+        for name in [
+            "song.flac",
+            "other.part",
+            ".napstr-download-not-a-uuid.flac.part",
+            ".napstr-serve-123.part",
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, b"keep").unwrap();
+            retained.push(path);
+        }
+        let outside_partial = outside.join(format!(
+            ".napstr-download-{}.mp3.part",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&outside_partial, b"keep").unwrap();
+        retained.push(outside_partial.clone());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("Audiobooks/Linked")).unwrap();
+            let link = root.join(format!(
+                ".napstr-download-{}.mp3.part",
+                uuid::Uuid::new_v4()
+            ));
+            std::os::unix::fs::symlink(&outside_partial, &link).unwrap();
+            retained.push(link);
+        }
+        cleanup_abandoned_downloads(&root).unwrap();
+        cleanup_abandoned_downloads(&root).unwrap();
+        assert!(abandoned.iter().all(|path| !path.exists()));
+        for path in retained {
+            assert_eq!(std::fs::read(&path).unwrap(), b"keep", "{}", path.display());
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn test_peer(
         db_path: PathBuf,

@@ -23,6 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 const PAIRING_LIFETIME_SECONDS: i64 = 5 * 60;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +57,7 @@ pub struct MobilePairingOffer {
 struct PairingSession {
     token: String,
     expires_at: i64,
+    // Legacy wire/database name: read-only host access still allows phone caching.
     stream_only: bool,
 }
 
@@ -309,14 +311,9 @@ impl MobileService {
             let permit = match self.request_slots.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    let _ = write_response(
-                        &mut send,
-                        &ServerResponse::Error {
-                            message: "Napstrfy has too many simultaneous requests".into(),
-                        },
-                    )
-                    .await;
-                    let _ = send.finish();
+                    // Never let an overloaded peer block the connection's accept loop.
+                    let _ = send.reset(1u32.into());
+                    let _ = receive.stop(1u32.into());
                     continue;
                 }
             };
@@ -692,9 +689,7 @@ impl MobileService {
                     if count == 0 {
                         break;
                     }
-                    send.write_all(&buffer[..count])
-                        .await
-                        .map_err(|error| format!("Iroh audio stream failed: {error}"))?;
+                    write_bytes(send, &buffer[..count]).await?;
                 }
                 Ok(())
             }
@@ -718,14 +713,8 @@ impl MobileService {
                     .await
                     .map_err(|error| error.to_string())?;
                 self.authorise(remote_id)?;
-                tokio::time::timeout(Duration::from_secs(30), async {
-                    write_response(send, &ServerResponse::AudioReady { track }).await?;
-                    send.write_all(&bytes)
-                        .await
-                        .map_err(|error| error.to_string())
-                })
-                .await
-                .map_err(|_| "Audio player stopped reading".to_string())?
+                write_response(send, &ServerResponse::AudioReady { track }).await?;
+                write_bytes(send, &bytes).await
             }
             ClientRequest::Available { file_ids } => {
                 if file_ids.len() > MAX_PAGE_SIZE
@@ -811,7 +800,7 @@ fn accept_pairing(
     remote_id: &str,
     token: &str,
     name: &str,
-    supports_streaming: bool,
+    _supports_streaming: bool,
 ) -> Result<bool, String> {
     let now = Utc::now();
     pairing.retain(|session| session.expires_at >= now.timestamp());
@@ -820,9 +809,6 @@ fn accept_pairing(
         .position(|session| session.token.as_bytes() == token.as_bytes())
         .ok_or("The pairing code is invalid or expired")?;
     let stream_only = pairing[index].stream_only;
-    if stream_only && !supports_streaming {
-        return Err("Update Napstrfy to use a stream-only pairing code".into());
-    }
     let endpoint = remote_id
         .parse::<iroh::EndpointId>()
         .map_err(|_| "invalid mobile Iroh identity")?;
@@ -861,11 +847,12 @@ fn check_request_permission(stream_only: bool, request: &ClientRequest) -> Resul
         | ClientRequest::Audiobooks { .. }
         | ClientRequest::AudiobookLibrary { .. }
         | ClientRequest::Audiobook { .. }
+        | ClientRequest::FetchAudio { .. }
         | ClientRequest::StreamAudio { .. }
         | ClientRequest::Available { .. }
         | ClientRequest::Status
         | ClientRequest::Ping => Ok(()),
-        _ => Err("This phone has stream-only access. Downloads are not permitted.".into()),
+        _ => Err("This phone has read-only access. Downloads on the Napstr host are not permitted.".into()),
     }
 }
 
@@ -1244,11 +1231,30 @@ async fn write_response(
     if payload.len() > MAX_CONTROL_FRAME_BYTES {
         return Err("Napstrfy response is too large".into());
     }
-    send.write_all(&(payload.len() as u32).to_be_bytes())
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    write_bytes(send, &frame).await
+}
+
+async fn write_bytes(send: &mut iroh::endpoint::SendStream, bytes: &[u8]) -> Result<(), String> {
+    let result = write_with_timeout(send, bytes, RESPONSE_WRITE_TIMEOUT).await;
+    if result.is_err() {
+        // A cancelled write may have sent part of a frame. Reset it instead of
+        // appending an error frame or waiting again on the same blocked stream.
+        let _ = send.reset(1u32.into());
+    }
+    result
+}
+
+async fn write_with_timeout<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    timeout: Duration,
+) -> Result<(), String> {
+    tokio::time::timeout(timeout, tokio::io::AsyncWriteExt::write_all(writer, bytes))
         .await
-        .map_err(|error| error.to_string())?;
-    send.write_all(&payload)
-        .await
+        .map_err(|_| "Napstrfy stopped reading the response".to_string())?
         .map_err(|error| error.to_string())
 }
 
@@ -1256,22 +1262,60 @@ async fn write_response(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn stalled_response_writes_release_request_slots() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(32));
+        let mut readers = Vec::new();
+        let mut requests = Vec::new();
+        for _ in 0..32 {
+            let permit = slots.clone().try_acquire_owned().unwrap();
+            let (mut writer, reader) = tokio::io::duplex(1);
+            readers.push(reader); // Connected peers deliberately never read.
+            requests.push(tokio::spawn(async move {
+                let _permit = permit;
+                write_with_timeout(&mut writer, b"response", Duration::from_millis(50)).await
+            }));
+        }
+        assert_eq!(slots.available_permits(), 0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for request in requests {
+                assert!(request.await.unwrap().unwrap_err().contains("stopped reading"));
+            }
+        }).await.unwrap();
+        assert_eq!(slots.available_permits(), 32);
+        drop(readers);
+    }
+
+    #[tokio::test]
+    async fn response_writes_preserve_bytes_for_reading_clients() {
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let received = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        write_with_timeout(&mut writer, b"complete response", Duration::from_secs(1)).await.unwrap();
+        drop(writer);
+        assert_eq!(received.await.unwrap(), b"complete response");
+    }
+
     #[test]
-    fn stream_only_requests_cannot_download_or_inspect_transfers() {
+    fn read_only_requests_can_cache_but_cannot_download_on_host_or_inspect_transfers() {
         for request in [
             ClientRequest::RequestDownload {
                 file_id: "a".repeat(64),
                 source_pubkeys: vec![],
                 destination_folder: None,
             },
-            ClientRequest::FetchAudio {
-                file_id: "a".repeat(64),
-            },
             ClientRequest::Transfers,
         ] {
             assert!(check_request_permission(true, &request).is_err());
             assert!(check_request_permission(false, &request).is_ok());
         }
+        assert!(check_request_permission(
+            true,
+            &ClientRequest::FetchAudio { file_id: "a".repeat(64) }
+        ).is_ok());
         assert!(check_request_permission(
             true,
             &ClientRequest::StreamAudio {
@@ -1341,8 +1385,8 @@ mod tests {
         ];
         assert!(accept_pairing(&db, &mut sessions, &endpoint, "expired", "Guest", true).is_err());
         assert!(accept_pairing(&db, &mut sessions, &endpoint, "wrong", "Guest", true).is_err());
-        assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest", false).is_err());
-        assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest", true).unwrap());
+        // Older clients can also fetch/cache audio; the host enforces their read-only grant.
+        assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest", false).unwrap());
         assert!(device_stream_only(&db, &endpoint).unwrap());
         assert!(accept_pairing(&db, &mut sessions, &endpoint, "stream", "Guest", true).is_err());
         assert!(!accept_pairing(&db, &mut sessions, &endpoint, "full", "Owner", false).unwrap());

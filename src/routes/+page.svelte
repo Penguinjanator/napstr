@@ -96,6 +96,10 @@
   let selectedResultIds = new Set<string>();
   let resultSelectionAnchor: string | null = null;
   let downloadingSelection = false;
+  let clearingTransfers = false;
+  let removingTransfers = new Set<number>();
+  let downloadGeneration = 0;
+  const pendingDownloadRequests = new Set<Promise<unknown>>();
   let advanced = false;
   let paused = false;
   let aboutOpen = false;
@@ -1033,7 +1037,8 @@
   }
 
   async function downloadSelectedResults() {
-    if (!nativeReady || downloadingSelection) return;
+    if (!nativeReady || downloadingSelection || clearingTransfers) return;
+    const generation = downloadGeneration;
     const targets = selectedResults();
     downloadingSelection = true;
     let requested = 0;
@@ -1041,13 +1046,14 @@
     let failed = 0;
     try {
       for (const target of targets) {
+        if (generation !== downloadGeneration) break;
         if (!canDownloadResult(target)) { skipped += 1; continue; }
         try {
           if (await startDownload(target)) requested += 1;
           else failed += 1;
         } catch { failed += 1; }
       }
-      activityMessage = `Requested ${requested} download${requested === 1 ? '' : 's'}`
+      if (generation === downloadGeneration) activityMessage = `Requested ${requested} download${requested === 1 ? '' : 's'}`
         + (skipped ? ` · ${skipped} already local, queued, or unavailable` : '')
         + (failed ? ` · ${failed} failed` : '');
     } finally {
@@ -1468,8 +1474,17 @@
     }
   }
 
+  async function requestNetworkDownload(args: Record<string, unknown>) {
+    if (clearingTransfers) throw new Error('Downloads are being cleared');
+    const request = invoke('request_network_download', args);
+    pendingDownloadRequests.add(request);
+    try { return await request; }
+    finally { pendingDownloadRequests.delete(request); }
+  }
+
   async function startDownload(target: Result | null = selected): Promise<boolean> {
-    if (!target) return false;
+    if (!target || clearingTransfers) return false;
+    const generation = downloadGeneration;
     if (target.audiobook) {
       await startAudiobookDownload(target.audiobook);
       return true;
@@ -1494,11 +1509,15 @@
       const candidateCount = Math.min(sources.length, 3);
       activityMessage = `Racing ${candidateCount} seeder${candidateCount === 1 ? '' : 's'} for the fastest Tor connection…`;
       try {
-        await invoke('request_network_download', { fileId: target.fileId, sourcePubkeys: sources.map((source) => source.pubkey) });
-        transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers'));
+        await requestNetworkDownload({ fileId: target.fileId, sourcePubkeys: sources.map((source) => source.pubkey) });
+        if (generation !== downloadGeneration) return false;
+        const updated = await invoke<NativeTransfer[]>('get_transfers');
+        if (generation !== downloadGeneration) return false;
+        transfers = mapTransfers(updated);
         activityMessage = 'Seeder race started · the fastest responsive source will stream the file';
         return true;
       } catch (error) {
+        if (generation !== downloadGeneration) return false;
         try { transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers')); }
         catch { transfers = transfers.filter((item) => item.fileId !== target.fileId); }
         activityMessage = `Request failed: ${String(error)}`;
@@ -1606,6 +1625,7 @@
   }
 
   async function requestNextAudiobookChapter(audiobookId: string) {
+    if (clearingTransfers) return;
     const queue = audiobookDownloads.find((item) => item.audiobookId === audiobookId);
     if (!queue || queue.activeFileId) return;
     while (queue.nextIndex < queue.chapters.length && isLocalFile(queue.chapters[queue.nextIndex].fileId)) queue.nextIndex += 1;
@@ -1636,14 +1656,16 @@
     audiobookDownloads = [...audiobookDownloads];
     startingDownloads = new Set(startingDownloads).add(chapter.fileId);
     try {
-      await invoke('request_network_download', {
+      await requestNetworkDownload({
         fileId: chapter.fileId,
         sourcePubkeys: queue.sources.map((source) => source.pubkey),
         destinationFolder: queue.destinationFolder
       });
+      if (!audiobookDownloads.includes(queue)) return;
       transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers'));
       activityMessage = `Downloading ${queue.title} · chapter ${queue.nextIndex + 1} of ${queue.chapters.length}`;
     } catch (error) {
+      if (!audiobookDownloads.includes(queue)) return;
       queue.failed += 1;
       queue.nextIndex += 1;
       queue.activeFileId = '';
@@ -1676,6 +1698,7 @@
   }
 
   async function startAudiobookDownload(book: Audiobook) {
+    if (clearingTransfers) return;
     if (book.chapters.every((chapter) => isLocalFile(chapter.fileId))) {
       await playAudiobook(book);
       return;
@@ -1782,14 +1805,46 @@
   }
 
   async function removeTransfer(id: number) {
-    if (nativeReady) {
-      try { await invoke('cancel_transfer', { id }); await invoke('remove_transfer', { id }); } catch (error) { activityMessage = `Could not remove transfer: ${String(error)}`; }
+    if (clearingTransfers || removingTransfers.has(id)) return;
+    const target = transfers.find((transfer) => transfer.id === id);
+    audiobookDownloads = audiobookDownloads.filter((book) => book.activeFileId !== target?.fileId);
+    removingTransfers = new Set(removingTransfers).add(id);
+    try {
+      if (nativeReady) await invoke('remove_transfer', { id });
+      transfers = transfers.filter((transfer) => transfer.id !== id);
+      activityMessage = 'Transfer removed; completed audio kept';
+    } catch (error) {
+      activityMessage = `Could not remove transfer: ${String(error)}`;
+    } finally {
+      removingTransfers = new Set([...removingTransfers].filter((value) => value !== id));
     }
-    transfers = transfers.filter((transfer) => transfer.id !== id);
-    if (nativeReady) await refreshLocalLibrary();
+  }
+
+  async function clearAllTransfers() {
+    if (clearingTransfers || removingTransfers.size) return;
+    clearingTransfers = true;
+    downloadGeneration += 1;
+    audiobookDownloads = [];
+    const pending = [...pendingDownloadRequests];
+    activityMessage = 'Stopping downloads and cleaning partial files…';
+    try {
+      if (nativeReady) {
+        await invoke('clear_all_transfers');
+        // A request already sent by the UI may still be entering the backend.
+        await Promise.allSettled(pending);
+        if (pending.length) await invoke('clear_all_transfers');
+        transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers'));
+      } else transfers = [];
+      activityMessage = 'All transfers cleared; partial downloads removed and completed audio kept';
+    } catch (error) {
+      activityMessage = `Could not clear all transfers: ${String(error)}`;
+    } finally {
+      clearingTransfers = false;
+    }
   }
 
   async function clearFinishedTransfers() {
+    if (clearingTransfers || removingTransfers.size) return;
     const finished = transfers.filter(isFinishedTransfer);
     if (!finished.length) return;
     const removed = new Set<number>();
@@ -2023,10 +2078,11 @@
         startingDownloads.size > 0 ||
         audiobookDownloads.length > 0 ||
         transfers.some(isActiveTransfer);
-      if (!nativeReady || transferPollPending || !transferWorkPending) return;
+      if (!nativeReady || transferPollPending || !transferWorkPending || clearingTransfers || removingTransfers.size) return;
       transferPollPending = true;
       try {
         const items = await invoke<NativeTransfer[]>('get_transfers');
+        if (clearingTransfers || removingTransfers.size) return;
         const previouslyComplete = new Set(transfers.filter(isCompleteTransfer).map((transfer) => transfer.fileId));
         const updated = mapTransfers(items);
         const newlyComplete = updated.filter((transfer) => isCompleteTransfer(transfer) && !previouslyComplete.has(transfer.fileId));
@@ -2035,8 +2091,8 @@
         transfers = [...optimistic, ...updated];
         if (newlyComplete.length || vanishedActive.length) {
           await refreshLocalLibrary();
-          const latest = newlyComplete[0] ?? vanishedActive[0];
-          activityMessage = `${latest.name} downloaded, verified, and ready to play`;
+          const latest = newlyComplete[0] ?? vanishedActive.find((transfer) => isLocalFile(transfer.fileId));
+          if (latest) activityMessage = `${latest.name} downloaded, verified, and ready to play`;
         }
         if (audiobookDownloads.length) await advanceAudiobookDownloads();
       } catch { /* the next transfer poll retries */ }
@@ -2277,14 +2333,14 @@
       {:else if activeView === 'Downloads'}
         <section class="full-panel downloads-view">
           <div class="panel-title"><span></span><b>Download Manager</b><span></span></div>
-          <div class="actionbar"><button class="classic-button" onclick={togglePause}>{paused ? '▶ Resume all' : 'Ⅱ Pause all'}</button><button class="classic-button" onclick={openNapstrFolder}>Open Napstr folder</button><button class="classic-button" onclick={clearFinishedTransfers} disabled={!transfers.some(isFinishedTransfer)}>Clear finished</button><div class="spacer"></div><span>{transfers.filter(isActiveTransfer).length} active · {transfers.filter(isCompleteTransfer).length} ready to play</span></div>
+          <div class="actionbar"><button class="classic-button" onclick={togglePause}>{paused ? '▶ Resume all' : 'Ⅱ Pause all'}</button><button class="classic-button" onclick={openNapstrFolder}>Open Napstr folder</button><button class="classic-button" onclick={clearFinishedTransfers} disabled={clearingTransfers || !transfers.some(isFinishedTransfer)}>Clear finished</button><button class="classic-button" onclick={clearAllTransfers} disabled={clearingTransfers || removingTransfers.size > 0 || (!transfers.length && !audiobookDownloads.length && !startingDownloads.size)}>{clearingTransfers ? 'Clearing…' : 'Clear all'}</button><div class="spacer"></div><span>{transfers.filter(isActiveTransfer).length} active · {transfers.filter(isCompleteTransfer).length} ready to play</span></div>
           <div class="download-queue">
             {#each audiobookDownloads as book}
               <div class="audiobook-download-row"><span class="audiobook-glyph">▥</span><b>{book.title}</b><div class="progress"><span style={`width:${book.chapters.length ? (book.nextIndex / book.chapters.length) * 100 : 0}%`}></span><b>{book.nextIndex}/{book.chapters.length}</b></div><span>{book.activeFileId ? `Downloading chapter ${book.nextIndex + 1}` : 'Preparing next chapter'}</span></div>
             {/each}
             <table class="file-table download-table"><thead><tr><th>Download order</th><th>Progress</th><th>Size</th><th>Speed</th><th>Status</th><th></th></tr></thead><tbody>
               {#each transfers as transfer}
-                <tr class:transfer-complete={isCompleteTransfer(transfer)} ondblclick={() => { if (isCompleteTransfer(transfer)) playAudio(transfer.fileId, transfer.name, playerMode, 'downloads'); }}><td><span class="download-arrow">{isCompleteTransfer(transfer) ? '▶' : '⇩'}</span>{transfer.name}</td><td><div class="progress"><span style={`width:${transfer.progress}%`}></span><b>{Math.round(transfer.progress)}%</b></div></td><td>{transfer.size}</td><td>{isCompleteTransfer(transfer) ? 'Local' : transfer.speed}</td><td>{isCompleteTransfer(transfer) ? 'Ready to play' : transfer.status}</td><td class="transfer-actions">{#if isCompleteTransfer(transfer)}<button class="classic-button transfer-play" onclick={(event) => { event.stopPropagation(); playAudio(transfer.fileId, transfer.name, playerMode, 'downloads'); }} title="Play verified audio">▶ Play</button>{/if}<button class="tiny-button" onclick={(event) => { event.stopPropagation(); removeTransfer(transfer.id); }} title="Remove from this list">×</button></td></tr>
+                <tr class:transfer-complete={isCompleteTransfer(transfer)} ondblclick={() => { if (isCompleteTransfer(transfer)) playAudio(transfer.fileId, transfer.name, playerMode, 'downloads'); }}><td><span class="download-arrow">{isCompleteTransfer(transfer) ? '▶' : '⇩'}</span>{transfer.name}</td><td><div class="progress"><span style={`width:${transfer.progress}%`}></span><b>{Math.round(transfer.progress)}%</b></div></td><td>{transfer.size}</td><td>{isCompleteTransfer(transfer) ? 'Local' : transfer.speed}</td><td>{isCompleteTransfer(transfer) ? 'Ready to play' : transfer.status}</td><td class="transfer-actions">{#if isCompleteTransfer(transfer)}<button class="classic-button transfer-play" onclick={(event) => { event.stopPropagation(); playAudio(transfer.fileId, transfer.name, playerMode, 'downloads'); }} title="Play verified audio">▶ Play</button>{/if}<button class="tiny-button" disabled={clearingTransfers || removingTransfers.has(transfer.id)} onclick={(event) => { event.stopPropagation(); removeTransfer(transfer.id); }} aria-label={`Remove transfer: ${transfer.name}`} title="Cancel and clear entry; keep completed audio">×</button></td></tr>
               {/each}
             </tbody></table>
             {#if transfers.length === 0}<p class="empty-state compact">There are no downloads in the queue.</p>{/if}
@@ -2429,13 +2485,13 @@
         onkeydown={resizeTransferWithKeyboard}
         ondblclick={() => setTransferPaneHeight(window.innerHeight < 700 ? 94 : 119, true)}
       ></button>
-      <div class="dock-title"><span></span><b>Transfer Manager</b><span></span><button class="dock-clear" onclick={clearFinishedTransfers} disabled={!transfers.some(isFinishedTransfer)}>Clear finished</button><button onclick={() => (activeView = 'Downloads')} title="Open Download Manager">□</button></div>
+      <div class="dock-title"><span></span><b>Transfer Manager</b><span></span><button class="dock-clear" onclick={clearFinishedTransfers} disabled={clearingTransfers || !transfers.some(isFinishedTransfer)}>Clear finished</button><button class="dock-clear" onclick={clearAllTransfers} disabled={clearingTransfers || removingTransfers.size > 0 || (!transfers.length && !audiobookDownloads.length && !startingDownloads.size)}>{clearingTransfers ? 'Clearing…' : 'Clear all'}</button><button onclick={() => (activeView = 'Downloads')} title="Open Download Manager">□</button></div>
       <div class="mini-transfers">
         {#each audiobookDownloads as book}
           <div class="mini-row audiobook-mini-row"><span class="audiobook-glyph">▥</span><span class="mini-name">{book.title} · chapter {Math.min(book.nextIndex + 1, book.chapters.length)} of {book.chapters.length}</span><div class="progress"><span style={`width:${book.chapters.length ? (book.nextIndex / book.chapters.length) * 100 : 0}%`}></span></div><span>{readableSize(book.chapters.reduce((sum, chapter) => sum + chapter.size, 0))}</span><span>Book</span></div>
         {/each}
         {#each transfers as transfer}
-          <div class:transfer-complete={isCompleteTransfer(transfer)} class="mini-row">{#if isCompleteTransfer(transfer)}<button class="mini-play" onclick={() => playAudio(transfer.fileId, transfer.name, playerMode, 'downloads')} title="Play verified audio">▶</button>{:else}<span class="download-arrow">⇩</span>{/if}<span class="mini-name">{transfer.name}</span><div class="progress"><span style={`width:${transfer.progress}%`}></span></div><span>{transfer.size}</span><span>{isCompleteTransfer(transfer) ? 'Ready' : transfer.speed}</span></div>
+          <div class:transfer-complete={isCompleteTransfer(transfer)} class="mini-row">{#if isCompleteTransfer(transfer)}<button class="mini-play" onclick={() => playAudio(transfer.fileId, transfer.name, playerMode, 'downloads')} title="Play verified audio">▶</button>{:else}<span class="download-arrow">⇩</span>{/if}<span class="mini-name">{transfer.name}</span><div class="progress"><span style={`width:${transfer.progress}%`}></span></div><span>{transfer.size}</span><span>{isCompleteTransfer(transfer) ? 'Ready' : transfer.speed}</span><button class="tiny-button mini-cancel" onclick={() => removeTransfer(transfer.id)} disabled={clearingTransfers || removingTransfers.has(transfer.id)} aria-label={`${isActiveTransfer(transfer) ? 'Cancel download' : 'Clear entry'}: ${transfer.name}`} title={isActiveTransfer(transfer) ? 'Cancel download and remove partial file' : 'Clear entry; keep completed audio'}>×</button></div>
         {/each}
       </div>
     </section>

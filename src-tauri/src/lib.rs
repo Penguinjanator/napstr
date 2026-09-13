@@ -1559,15 +1559,11 @@ fn unique_destination(folder: &Path, filename: &str) -> PathBuf {
 }
 
 #[tauri::command]
-fn remove_transfer(id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    let connection = open_db(&state)?;
+async fn remove_transfer(id: i64, state: State<'_, AppState>) -> Result<(), String> {
     if id < 0 {
-        connection.execute("DELETE FROM download_sources WHERE request_id=(SELECT request_id FROM network_downloads WHERE rowid=?1)", [-id]).map_err(|error| error.to_string())?;
-        connection
-            .execute("DELETE FROM network_downloads WHERE rowid = ?1", [-id])
-            .map_err(|error| error.to_string())?;
+        state.network.transfers().remove_downloads(Some(id.checked_neg().ok_or("Invalid transfer ID")?)).await?;
     } else {
-        connection
+        open_db(&state)?
             .execute("DELETE FROM transfers WHERE id = ?1", [id])
             .map_err(|error| error.to_string())?;
     }
@@ -1575,16 +1571,15 @@ fn remove_transfer(id: i64, state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn set_downloads_paused(paused: bool, state: State<'_, AppState>) -> Result<(), String> {
-    state.network.transfers().set_paused(paused).await;
+async fn clear_all_transfers(state: State<'_, AppState>) -> Result<(), String> {
+    state.network.transfers().remove_downloads(None).await?;
+    open_db(&state)?.execute("DELETE FROM transfers", []).map_err(|error| error.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-async fn cancel_transfer(id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    if id < 0 {
-        state.network.transfers().cancel_by_rowid(-id).await?;
-    }
+async fn set_downloads_paused(paused: bool, state: State<'_, AppState>) -> Result<(), String> {
+    state.network.transfers().set_paused(paused).await;
     Ok(())
 }
 
@@ -2232,7 +2227,7 @@ pub fn run() {
             player::set_audio_volume,
             player::audio_status,
             set_downloads_paused,
-            cancel_transfer,
+            clear_all_transfers,
             start_network,
             network_status,
             recover_after_sleep,

@@ -20,7 +20,7 @@ use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufWriter, SeekFrom},
     net::TcpListener,
-    sync::{watch, Mutex, RwLock, Semaphore},
+    sync::{watch, Mutex, Notify, RwLock, Semaphore},
     task::JoinHandle,
     time::timeout,
 };
@@ -282,6 +282,8 @@ struct DownloadCoordinator {
     primary_slot: Arc<Semaphore>,
     workers: AtomicUsize,
     complete: AtomicBool,
+    stopped: Notify,
+    partial_paths: std::sync::Mutex<Vec<PathBuf>>,
 }
 
 impl DownloadCoordinator {
@@ -294,7 +296,20 @@ impl DownloadCoordinator {
             primary_slot: Arc::new(Semaphore::new(1)),
             workers: AtomicUsize::new(0),
             complete: AtomicBool::new(false),
+            stopped: Notify::new(),
+            partial_paths: std::sync::Mutex::new(Vec::new()),
         })
+    }
+}
+
+async fn until_cancelled(
+    cancel: &CancellationToken,
+    transfer: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err("cancelled".into()),
+        result = transfer => result,
     }
 }
 
@@ -453,6 +468,9 @@ impl TransferService {
         if !is_v3_onion(&offer.onion) {
             return Err("refusing a download offer without a valid Tor v3 onion".into());
         }
+        // Registration and removal share this lock so a late offer cannot
+        // start another worker after its entry has been removed.
+        let mut active_guard = self.active.lock().await;
         let status: Option<String> = crate::open_connection(&self.db_path)?
             .query_row(
                 "SELECT status FROM network_downloads WHERE request_id=?1",
@@ -472,23 +490,26 @@ impl TransferService {
         let active = self.active.clone();
         let request_id = offer.request_id.clone();
         let coordinator = {
-            let mut active = self.active.lock().await;
             let initially_paused = self.globally_paused.load(Ordering::SeqCst);
-            active
+            active_guard
                 .entry(request_id.clone())
                 .or_insert_with(|| DownloadCoordinator::new(initially_paused))
                 .clone()
         };
         coordinator.workers.fetch_add(1, Ordering::SeqCst);
+        drop(active_guard);
         let pause_rx = coordinator.paused.subscribe();
         tokio::spawn(async move {
-            let result = download_offer(
-                &db_path,
-                tor,
-                &offer,
-                &source_pubkey,
-                coordinator.clone(),
-                pause_rx,
+            let result = until_cancelled(
+                &coordinator.cancel,
+                download_offer(
+                    &db_path,
+                    tor,
+                    &offer,
+                    &source_pubkey,
+                    coordinator.clone(),
+                    pause_rx,
+                ),
             )
             .await;
             let remaining = coordinator.workers.fetch_sub(1, Ordering::SeqCst) - 1;
@@ -513,6 +534,7 @@ impl TransferService {
             }
             if remaining == 0 {
                 active.lock().await.remove(&request_id);
+                coordinator.stopped.notify_waiters();
             }
         });
         Ok(())
@@ -525,22 +547,78 @@ impl TransferService {
         }
     }
 
-    pub async fn cancel_by_rowid(&self, rowid: i64) -> Result<(), String> {
-        let connection = crate::open_connection(&self.db_path)?;
-        let request_id: Option<String> = connection
-            .query_row(
-                "SELECT request_id FROM network_downloads WHERE rowid=?1",
-                [rowid],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some(request_id) = request_id {
-            if let Some(transfer) = self.active.lock().await.get(&request_id) {
+    pub async fn remove_downloads(&self, rowid: Option<i64>) -> Result<(), String> {
+        let stopped = {
+            let active = self.active.lock().await;
+            let mut connection = crate::open_connection(&self.db_path)?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            let requests = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT request_id FROM network_downloads WHERE ?1 IS NULL OR rowid=?1",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([rowid], |row| row.get::<_, String>(0))
+                    .map_err(|error| error.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?
+            };
+            for request in &requests {
+                transaction
+                    .execute(
+                        "DELETE FROM download_sources WHERE request_id=?1",
+                        [request],
+                    )
+                    .map_err(|error| error.to_string())?;
+                transaction
+                    .execute(
+                        "DELETE FROM network_downloads WHERE request_id=?1",
+                        [request],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            transaction.commit().map_err(|error| error.to_string())?;
+            let stopped = requests
+                .iter()
+                .filter_map(|request| active.get(request).cloned())
+                .collect::<Vec<_>>();
+            for transfer in &stopped {
                 transfer.cancel.cancel();
             }
-            let progress = current_progress(&self.db_path, &request_id).unwrap_or(0.0);
-            update_download(&self.db_path, &request_id, progress, "Cancelled", "—", None)?;
+            stopped
+        };
+        for transfer in stopped {
+            loop {
+                let notified = transfer.stopped.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if transfer.workers.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                notified.await;
+            }
+            // Retry cleanup after all file handles have been dropped. These
+            // paths belong to this request, never to another running instance.
+            let paths = transfer
+                .partial_paths
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            for path in paths {
+                match fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "Could not remove partial download {}: {error}",
+                            path.display()
+                        ))
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -793,6 +871,11 @@ async fn download_offer(
     let (partial_file, partial_guard) =
         create_temporary_file(&destination_root, "napstr-download", Path::new(&filename)).await?;
     let partial = partial_guard.path.clone();
+    coordinator
+        .partial_paths
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(partial.clone());
     let final_result: Result<(), String> = async {
         while *pause.borrow() {
             update_download(
@@ -1024,6 +1107,129 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use tokio::io::{duplex, DuplexStream};
+
+    #[tokio::test]
+    async fn removing_downloads_stops_stalled_workers_and_preserves_completed_and_unrelated_files()
+    {
+        let (directory, db_path, file_id, bytes) = shared_fixture();
+        let service = TransferService::new(
+            db_path.clone(),
+            Arc::new(TorManager::new(directory.clone(), directory.clone())),
+        );
+        let connection = crate::open_connection(&db_path).unwrap();
+        for request in ["active", "waiting", "failed"] {
+            connection.execute(
+                "INSERT INTO network_downloads(request_id,file_id,source_pubkey,filename,size,progress,status,speed,destination,onion,updated_at)
+                 VALUES(?1,?2,'source','song.wav',100,12,?3,'—','','','now')",
+                params![request, file_id, if request == "failed" { "Failed: stalled" } else { "Connecting" }],
+            ).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO download_sources VALUES(?1,'source','Requested','now')",
+                    [request],
+                )
+                .unwrap();
+        }
+        let rowid: i64 = connection
+            .query_row(
+                "SELECT rowid FROM network_downloads WHERE request_id='active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let coordinator = DownloadCoordinator::new(true);
+        coordinator.workers.store(1, Ordering::SeqCst);
+        let (file, guard) =
+            create_temporary_file(&directory, "napstr-download", Path::new("song.wav"))
+                .await
+                .unwrap();
+        let partial = guard.path.clone();
+        coordinator
+            .partial_paths
+            .lock()
+            .unwrap()
+            .push(partial.clone());
+        service
+            .active
+            .lock()
+            .await
+            .insert("active".into(), coordinator.clone());
+        let unrelated = directory.join(format!(
+            ".napstr-download-{}.wav.part",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&unrelated, b"another instance").unwrap();
+        let active = service.active.clone();
+        let worker = tokio::spawn(async move {
+            let result = until_cancelled(&coordinator.cancel, async move {
+                let _file = file;
+                let _guard = guard;
+                std::future::pending::<Result<(), String>>().await
+            })
+            .await;
+            assert_eq!(result.unwrap_err(), "cancelled");
+            coordinator.workers.store(0, Ordering::SeqCst);
+            active.lock().await.remove("active");
+            coordinator.stopped.notify_waiters();
+        });
+        timeout(
+            Duration::from_secs(1),
+            service.remove_downloads(Some(rowid)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        worker.await.unwrap();
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"another instance");
+        assert_eq!(std::fs::read(directory.join("payload.wav")).unwrap(), bytes);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM network_downloads", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        service.remove_downloads(None).await.unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM network_downloads", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM download_sources", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM files", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        service
+            .accept_offer(
+                DownloadOffer {
+                    request_id: "active".into(),
+                    file_id,
+                    onion: format!("{}.onion", "a".repeat(56)),
+                    port: 80,
+                    capability: "expired-request".into(),
+                    expires_at: Utc::now().timestamp() + 60,
+                },
+                "source".into(),
+            )
+            .await
+            .unwrap();
+        assert!(service.active.lock().await.is_empty());
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"another instance");
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn startup_cleanup_only_removes_napstr_download_partials() {

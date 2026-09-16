@@ -30,10 +30,10 @@ jobs:
             bundles: nsis
           - name: macOS-Intel
             runner: macos-15-intel
-            bundles: dmg
+            bundles: app
           - name: macOS-Apple-Silicon
             runner: macos-15
-            bundles: dmg
+            bundles: app
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -79,7 +79,23 @@ jobs:
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
           NO_STRIP: '1'
-        run: npm run bundle -- --config src-tauri/tauri.ci.conf.json --bundles '${{ matrix.bundles }}' -- --locked
+        run: npm run bundle -- --verbose --config src-tauri/tauri.ci.conf.json --bundles '${{ matrix.bundles }}' -- --locked
+      - name: Package macOS DMG
+        if: runner.os == 'macOS'
+        run: |
+          # Retry only packaging, without recompiling or skipping verification.
+          # Verbose output exposes hdiutil errors hidden by the default logger.
+          for attempt in 1 2 3; do
+            if npm run tauri -- bundle --verbose --ci --config src-tauri/tauri.ci.conf.json --bundles dmg; then
+              break
+            fi
+            if [[ "$attempt" == 3 ]]; then
+              echo 'Napstrfy DMG packaging failed after three attempts' >&2
+              exit 1
+            fi
+            echo "DMG packaging attempt $attempt failed; retrying in 10 seconds" >&2
+            sleep 10
+          done
       - name: Prepare and smoke-test AppImage
         if: runner.os == 'Linux'
         run: |
@@ -153,7 +169,10 @@ jobs:
   release:
     name: Attach Napstrfy desktop installers to release
     needs: build
+    # Attach verified artifacts from successful platforms even if another fails.
+    # The failed build still leaves the overall workflow red.
     if: >-
+      !cancelled() && needs.build.result != 'skipped' &&
       github.ref_type == 'tag' && startsWith(github.ref_name, 'v') &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-22.04

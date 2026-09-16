@@ -15,7 +15,6 @@
   } from '@tauri-apps/plugin-barcode-scanner';
   import TrackArtwork from './lib/TrackArtwork.svelte';
   import SeekIcon from './lib/SeekIcon.svelte';
-  import { playbackTiming, playbackSeekTarget } from './lib/playback';
   import appIcon from '../src-tauri/icons/icon.png';
   import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, LibraryPage, PodcastDownload, PodcastEpisode, PodcastFeed, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack, RemoteTransfer } from './lib/types';
 
@@ -82,11 +81,7 @@
   let caching = $state(false);
   let currentTime = $state(0);
   let duration = $state(0);
-  let seekStart = $state(0);
-  let seekEnd = $state(0);
-  let seekReady = $state(false);
-  let playbackSource = '';
-  const canSeek = $derived(seekReady && !caching);
+  const canSeek = $derived(duration > 0 && !caching);
   let volume = $state(0.85);
   let pending = $state(new Map<string, string>());
   let pendingAudiobooks = $state(new Map<string, string>());
@@ -538,7 +533,6 @@
   async function playTrack(track: RemoteTrack, libraryVisible = playerQueueLibraryVisible) {
     if (caching) return;
     caching = true;
-    resetPlaybackTiming();
     error = '';
     current = track;
     activeMedia = 'music';
@@ -547,7 +541,7 @@
       const cached = await invoke<CachedAudio>('cache_remote_audio', { track, libraryVisible });
       current = cached.track;
       await tick();
-      setPlaybackSource(cached.url);
+      audio.src = cached.url;
       audio.volume = volume;
       await audio.play();
       playing = true;
@@ -569,7 +563,6 @@
       error = msg("Could not play {p0}: {p1}", { p0: title(track), p1: String(nextError) });
     } finally {
       caching = false;
-      refreshPlaybackTiming(true);
     }
   }
 
@@ -766,40 +759,12 @@
     }
   }
 
-  function resetPlaybackTiming() {
-    playbackSource = '';
-    currentTime = 0;
-    duration = 0;
-    seekStart = 0;
-    seekEnd = 0;
-    seekReady = false;
-  }
-
-  function setPlaybackSource(url: string, durationHint = 0) {
-    resetPlaybackTiming();
-    duration = Number.isFinite(durationHint) && durationHint > 0 ? durationHint : 0;
-    audio.src = url;
-    playbackSource = audio.src;
-  }
-
-  function refreshPlaybackTiming(force = false) {
-    if (!audio || !playbackSource || audio.currentSrc !== playbackSource) return;
-    const timing = playbackTiming(audio, duration);
-    const changed = duration !== timing.duration || seekReady !== timing.canSeek;
-    duration = timing.duration;
-    seekStart = timing.start;
-    seekEnd = timing.end;
-    seekReady = timing.canSeek;
-    currentTime = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
-    syncSystemMedia(force || changed);
-  }
-
   function seek(value: number) {
-    if (!audio || caching || !playbackSource || audio.currentSrc !== playbackSource) return;
-    const target = playbackSeekTarget(audio, value, duration);
-    if (target === null) return;
+    if (!audio || caching || !Number.isFinite(value) || !Number.isFinite(audio.duration) || audio.duration <= 0) return;
+    const target = Math.max(0, Math.min(audio.duration, value));
     audio.currentTime = target;
-    refreshPlaybackTiming(true);
+    currentTime = target;
+    syncSystemMedia(true);
   }
 
   function skipSeconds(offset: number) {
@@ -1071,7 +1036,6 @@
   async function playPodcast(episode: PodcastEpisode) {
     if (caching) return;
     caching = true;
-    resetPlaybackTiming();
     error = '';
     try {
       audio?.pause();
@@ -1080,7 +1044,7 @@
       currentPodcast = episode;
       currentPodcastFeed = [selectedPodcast, currentPodcastFeed, ...likedPodcasts, ...podcastFeeds]
         .find((feed) => feed?.id === episode.feedId) ?? null;
-      setPlaybackSource(source.url, episode.duration);
+      audio.src = source.url;
       audio.volume = volume;
       await audio.play();
       rememberPodcast(episode);
@@ -1089,7 +1053,6 @@
       error = msg("Could not play {p0}: {p1}", { p0: episode.title, p1: String(nextError) });
     } finally {
       caching = false;
-      refreshPlaybackTiming(true);
     }
   }
 
@@ -1370,7 +1333,7 @@
         {#if currentPodcast.image}<img class="podcast-player-art" src={currentPodcast.image} alt="" />{:else}<div class="empty-art">◉</div>{/if}
       {:else if current}<TrackArtwork track={current} large lookup onartworkchange={(url) => { currentArtwork = url; }} />{:else}<div class="empty-art">♪</div>{/if}
       <div class="now-copy"><strong>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.title : current ? title(current) : $t("Choose something to play")}</strong><small>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.feedTitle : current ? artist(current) : $t("Music and podcasts, wherever you are")}</small></div>
-      <div class="timeline"><input aria-label={$t("Playback position")} type="range" min={seekStart} max={seekEnd} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} disabled={!canSeek} /><span>{clock(currentTime)} / {duration > 0 ? clock(duration) : '—'}</span></div>
+      <div class="timeline"><input aria-label={$t("Playback position")} type="range" min="0" max={duration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} disabled={!canSeek} /><span>{clock(currentTime)} / {clock(duration)}</span></div>
       <div class="player-buttons">
         <button onclick={() => moveTrack(-1)} disabled={activeMedia !== 'music' || playerQueue.length < 2 || (playMode === 'random' && randomHistoryIndex <= 0)} aria-label={$t("Previous track")}>|◀</button>
         <button class="seek-button" onclick={() => skipSeconds(-15)} disabled={!canSeek} aria-label={$t("Back 15 seconds")} title={$t("Back 15 seconds")}><SeekIcon /></button>
@@ -1406,12 +1369,8 @@
   bind:this={audio}
   onplay={() => { playing = true; syncSystemMedia(true); }}
   onpause={() => { playing = false; syncSystemMedia(true); }}
-  ontimeupdate={() => refreshPlaybackTiming()}
-  onloadedmetadata={() => refreshPlaybackTiming(true)}
-  ondurationchange={() => refreshPlaybackTiming(true)}
-  onprogress={() => refreshPlaybackTiming()}
-  oncanplay={() => refreshPlaybackTiming(true)}
-  onplaying={() => refreshPlaybackTiming(true)}
+  ontimeupdate={() => { currentTime = audio.currentTime; syncSystemMedia(); }}
+  ondurationchange={() => { duration = Number.isFinite(audio.duration) ? audio.duration : 0; syncSystemMedia(true); }}
   onended={handleTrackEnded}
   onerror={() => {
     if (activeMedia === 'podcast' && currentPodcast) error = msg("This device could not play {p0}.", { p0: currentPodcast.title });

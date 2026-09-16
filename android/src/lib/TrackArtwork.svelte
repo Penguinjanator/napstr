@@ -2,10 +2,12 @@
   import { artworkFor, artworkHue } from './artwork';
   import type { RemoteTrack } from './types';
 
-  let { track, lookup = false, large = false }: { track: RemoteTrack; lookup?: boolean; large?: boolean } = $props();
+  let { track, lookup = false, large = false, onartworkchange }: { track: RemoteTrack; lookup?: boolean; large?: boolean; onartworkchange?: (url: string) => void } = $props();
   let image = $state('');
   let failed = $state(false);
   let hue = $derived(artworkHue(track.fileId));
+
+  $effect(() => { onartworkchange?.(image && !failed ? image : ''); });
 
   $effect(() => {
     let alive = true;

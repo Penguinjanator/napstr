@@ -14,6 +14,9 @@
     scan
   } from '@tauri-apps/plugin-barcode-scanner';
   import TrackArtwork from './lib/TrackArtwork.svelte';
+  import SeekIcon from './lib/SeekIcon.svelte';
+  import { playbackTiming, playbackSeekTarget } from './lib/playback';
+  import appIcon from '../src-tauri/icons/icon.png';
   import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, LibraryPage, PodcastDownload, PodcastEpisode, PodcastFeed, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack, RemoteTransfer } from './lib/types';
 
   const musicChips = ['Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat'];
@@ -43,6 +46,17 @@
   let cameraPermissionDenied = $state(false);
   let error = $state<string | Message>('');
   let notice = $state<string | Message>('');
+  $effect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => { notice = ''; }, 10_000);
+    return () => window.clearTimeout(timer);
+  });
+  $effect(() => {
+    // Pairing errors can contain a camera-permission action; keep those visible.
+    if (!error || (!status.paired && activeTab !== 'podcasts')) return;
+    const timer = window.setTimeout(() => { error = ''; }, 10_000);
+    return () => window.clearTimeout(timer);
+  });
   let query = $state('');
   let tracks = $state<RemoteTrack[]>([]);
   let likedMusic = $state<RemoteTrack[]>([]);
@@ -68,6 +82,11 @@
   let caching = $state(false);
   let currentTime = $state(0);
   let duration = $state(0);
+  let seekStart = $state(0);
+  let seekEnd = $state(0);
+  let seekReady = $state(false);
+  let playbackSource = '';
+  const canSeek = $derived(seekReady && !caching);
   let volume = $state(0.85);
   let pending = $state(new Map<string, string>());
   let pendingAudiobooks = $state(new Map<string, string>());
@@ -89,9 +108,16 @@
   let podcastLoading = $state(false);
   let podcastViewVersion = 0;
   let currentPodcast = $state<PodcastEpisode | null>(null);
+  let currentPodcastFeed = $state<PodcastFeed | null>(null);
   let activeMedia = $state<'music' | 'podcast'>('music');
+  const playerLiked = $derived(activeMedia === 'music'
+    ? Boolean(current && isTrackLiked(current))
+    : Boolean(currentPodcastFeed && isPodcastLiked(currentPodcastFeed)));
+  const playerLikeTitle = $derived(activeMedia === 'music' ? current && title(current) : currentPodcastFeed?.title);
   let audio: HTMLAudioElement;
   let lastSystemMediaSync = 0;
+  let currentArtwork = $state('');
+  const playerArtwork = $derived(activeMedia === 'podcast' ? currentPodcast?.image || '' : current ? currentArtwork : '');
 
   type AndroidMediaBridge = {
     update(payload: string): void;
@@ -371,8 +397,8 @@
   }
 
   function showPairing() {
+    if (!status.paired) { activeTab = 'music'; return; }
     pairingDialog.showModal();
-    if (!status.paired) activeTab = 'music';
   }
 
   async function loadLibrary(append = false) {
@@ -512,6 +538,7 @@
   async function playTrack(track: RemoteTrack, libraryVisible = playerQueueLibraryVisible) {
     if (caching) return;
     caching = true;
+    resetPlaybackTiming();
     error = '';
     current = track;
     activeMedia = 'music';
@@ -520,7 +547,7 @@
       const cached = await invoke<CachedAudio>('cache_remote_audio', { track, libraryVisible });
       current = cached.track;
       await tick();
-      audio.src = cached.url;
+      setPlaybackSource(cached.url);
       audio.volume = volume;
       await audio.play();
       playing = true;
@@ -542,6 +569,7 @@
       error = msg("Could not play {p0}: {p1}", { p0: title(track), p1: String(nextError) });
     } finally {
       caching = false;
+      refreshPlaybackTiming(true);
     }
   }
 
@@ -653,7 +681,8 @@
     const metadata = {
       title: activeMedia === 'podcast' ? currentPodcast?.title : current ? title(current) : '',
       artist: activeMedia === 'podcast' ? currentPodcast?.feedTitle : current ? artist(current) : '',
-      labels: { previous: $t('Previous track'), play: $t('Play'), pause: $t('Pause'), next: $t('Next track'), channel: $t('Media playback') },
+      labels: { previous: $t('Previous track'), rewind: $t('Back 15 seconds'), play: $t('Play'), pause: $t('Pause'), forward: $t('Forward 15 seconds'), next: $t('Next track'), channel: $t('Media playback') },
+      canSeek,
       playing,
       position: Number.isFinite(currentTime) ? currentTime : 0,
       duration: Number.isFinite(duration) ? duration : 0,
@@ -686,8 +715,8 @@
       ['previoustrack', () => { void moveTrack(-1); }],
       ['nexttrack', () => { void moveTrack(1); }],
       ['seekto', (event) => { if (event.seekTime !== undefined) seek(event.seekTime); }],
-      ['seekbackward', (event) => seek(currentTime - (event.seekOffset ?? 10))],
-      ['seekforward', (event) => seek(currentTime + (event.seekOffset ?? 10))]
+      ['seekbackward', (event) => skipSeconds(-(event.seekOffset ?? 15))],
+      ['seekforward', (event) => skipSeconds(event.seekOffset ?? 15)]
     ];
     const registered: MediaSessionAction[] = [];
     for (const [action, handler] of handlers) {
@@ -712,8 +741,8 @@
     if (event.target instanceof HTMLElement && event.target.closest('input, textarea, select, button, a, summary, [contenteditable="true"]')) return;
     if (!current && !currentPodcast) return;
     if (event.code === 'Space') { event.preventDefault(); togglePlayer(); }
-    else if (event.key === 'ArrowLeft') { event.preventDefault(); seek(currentTime - 10); }
-    else if (event.key === 'ArrowRight') { event.preventDefault(); seek(currentTime + 10); }
+    else if (event.key === 'ArrowLeft') { event.preventDefault(); skipSeconds(-15); }
+    else if (event.key === 'ArrowRight') { event.preventDefault(); skipSeconds(15); }
   }
 
   function handleSystemMediaAction(event: Event) {
@@ -727,17 +756,54 @@
       void moveTrack(-1);
     } else if (action === 'next') {
       void moveTrack(1);
+    } else if (action === 'rewind') {
+      skipSeconds(-15);
+    } else if (action === 'forward') {
+      skipSeconds(15);
     } else if (action.startsWith('seek:')) {
       const milliseconds = Number(action.slice(5));
       if (Number.isFinite(milliseconds)) seek(milliseconds / 1000);
     }
   }
 
+  function resetPlaybackTiming() {
+    playbackSource = '';
+    currentTime = 0;
+    duration = 0;
+    seekStart = 0;
+    seekEnd = 0;
+    seekReady = false;
+  }
+
+  function setPlaybackSource(url: string, durationHint = 0) {
+    resetPlaybackTiming();
+    duration = Number.isFinite(durationHint) && durationHint > 0 ? durationHint : 0;
+    audio.src = url;
+    playbackSource = audio.src;
+  }
+
+  function refreshPlaybackTiming(force = false) {
+    if (!audio || !playbackSource || audio.currentSrc !== playbackSource) return;
+    const timing = playbackTiming(audio, duration);
+    const changed = duration !== timing.duration || seekReady !== timing.canSeek;
+    duration = timing.duration;
+    seekStart = timing.start;
+    seekEnd = timing.end;
+    seekReady = timing.canSeek;
+    currentTime = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+    syncSystemMedia(force || changed);
+  }
+
   function seek(value: number) {
-    if (!audio || !Number.isFinite(audio.duration)) return;
-    audio.currentTime = Math.min(audio.duration, Math.max(0, value));
-    currentTime = audio.currentTime;
-    syncSystemMedia(true);
+    if (!audio || caching || !playbackSource || audio.currentSrc !== playbackSource) return;
+    const target = playbackSeekTarget(audio, value, duration);
+    if (target === null) return;
+    audio.currentTime = target;
+    refreshPlaybackTiming(true);
+  }
+
+  function skipSeconds(offset: number) {
+    if (audio) seek(audio.currentTime + offset);
   }
 
   function setVolume(value: number) {
@@ -1005,15 +1071,16 @@
   async function playPodcast(episode: PodcastEpisode) {
     if (caching) return;
     caching = true;
+    resetPlaybackTiming();
     error = '';
     try {
       audio?.pause();
       const source = await invoke<{ url: string; downloaded: boolean }>('podcast_playback_url', { episode });
       activeMedia = 'podcast';
       currentPodcast = episode;
-      currentTime = 0;
-      duration = episode.duration || 0;
-      audio.src = source.url;
+      currentPodcastFeed = [selectedPodcast, currentPodcastFeed, ...likedPodcasts, ...podcastFeeds]
+        .find((feed) => feed?.id === episode.feedId) ?? null;
+      setPlaybackSource(source.url, episode.duration);
       audio.volume = volume;
       await audio.play();
       rememberPodcast(episode);
@@ -1022,6 +1089,7 @@
       error = msg("Could not play {p0}: {p1}", { p0: episode.title, p1: String(nextError) });
     } finally {
       caching = false;
+      refreshPlaybackTiming(true);
     }
   }
 
@@ -1113,7 +1181,7 @@
 {#if !status.paired && activeTab !== 'podcasts'}
   <main class="pair-screen">
     <div class="pair-glow"></div>
-    <div class="pair-logo" aria-label="Napstrfy"><img src="/favicon.png" alt="" /><span>napstrfy</span></div>
+    <div class="pair-logo" aria-label="Napstrfy"><img src={appIcon} alt="" /><span>napstrfy</span></div>
     <p class="eyebrow">{$t("NAPSTR COMPANION")}</p>
     <h1>{$t("Your music.")}<br />{$t("Wherever you are.")}</h1>
     <p class="pair-copy">{$t("Connect to the computer running Napstr. Browse its library and listen here, with your music sent over an encrypted connection.")}</p>
@@ -1135,13 +1203,13 @@
       </form>
     </details>
     <button class="browse-podcasts" onclick={showPodcasts}>{$t("Listen to podcasts without pairing")}</button>
-    <button class="browse-podcasts" onclick={showPairing}>{$t("Settings")}</button>
+    <LanguageSelect />
     <small class="pair-security">{$t("One-use pairing · no Nostr keys leave your computer")}</small>
   </main>
 {:else}
-  <main class="app-shell">
+  <main class="app-shell" class:desktop={!mobile && platform !== ''}>
     <header class="app-header">
-      <div class="brand"><img src="/napstr-logo-small.png" alt="" /><b>napstrfy</b></div>
+      <div class="brand"><img src={appIcon} alt="" /><b>napstrfy</b></div>
       {#if status.paired}
         <button class="desktop-status" class:offline={!status.connected} onclick={reconnect}><i></i><span>{statusPending ? $t("Connecting…") : status.connected ? status.desktopName || $t("Napstr connected") : $t("Reconnect")}{status.streamOnly ? $t(" · Read only") : ''}</span></button>
       {:else}
@@ -1149,6 +1217,7 @@
       {/if}
     </header>
 
+    <div class="app-content">
     {#if error}<button class="error-banner" onclick={() => (error = '')}>{$t(error)}<span>×</span></button>{/if}
     {#if notice}<button class="notice-banner" onclick={() => (notice = '')}>{$t(notice)}<span>×</span></button>{/if}
 
@@ -1168,7 +1237,7 @@
 
       <section class="track-list" aria-busy={loading}>
         {#if loading}<div class="loading-list"><i></i><span>{$t("Asking Napstr…")}</span></div>{/if}
-        {#if !loading && tracks.length === 0}<div class="empty-library"><img src="/napstr-logo-small.png" alt="" /><h2>{showingLikedMusic ? $t("No liked tracks yet") : $t("No tracks found")}</h2><p>{showingLikedMusic ? $t("Tap the heart beside a song to keep it here.") : query ? $t("Try different words or clear the search.") : $t("Add music to your Napstr folder on the computer.")}</p></div>{/if}
+        {#if !loading && tracks.length === 0}<div class="empty-library"><img src={appIcon} alt="" /><h2>{showingLikedMusic ? $t("No liked tracks yet") : $t("No tracks found")}</h2><p>{showingLikedMusic ? $t("Tap the heart beside a song to keep it here.") : query ? $t("Try different words or clear the search.") : $t("Add music to your Napstr folder on the computer.")}</p></div>{/if}
         {#each tracks as track, index (track.fileId)}
           <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class="track-row">
             <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
@@ -1285,6 +1354,8 @@
       {/if}
     {/if}
 
+    </div>
+
     <nav class="app-nav" aria-label={$t("Napstrfy navigation")}>
       <button class:active={activeTab === 'music'} aria-current={activeTab === 'music' ? 'page' : undefined} onclick={() => (activeTab = 'music')}><span aria-hidden="true">♫</span>{$t("Music")}</button>
       <button class:active={activeTab === 'podcasts'} aria-current={activeTab === 'podcasts' ? 'page' : undefined} onclick={showPodcasts}><span aria-hidden="true">◉</span>{$t("Podcasts")}</button>
@@ -1293,26 +1364,35 @@
     </nav>
 
     <section class:empty={activeMedia === 'music' ? !current : !currentPodcast} class="now-playing">
+      <div class="player-backdrop" aria-hidden="true"><span style:background-image={playerArtwork ? `url(${JSON.stringify(playerArtwork)})` : undefined}></span></div>
+      <div class="player-content">
       {#if activeMedia === 'podcast' && currentPodcast}
         {#if currentPodcast.image}<img class="podcast-player-art" src={currentPodcast.image} alt="" />{:else}<div class="empty-art">◉</div>{/if}
-      {:else if current}<TrackArtwork track={current} large lookup />{:else}<div class="empty-art">♪</div>{/if}
+      {:else if current}<TrackArtwork track={current} large lookup onartworkchange={(url) => { currentArtwork = url; }} />{:else}<div class="empty-art">♪</div>{/if}
       <div class="now-copy"><strong>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.title : current ? title(current) : $t("Choose something to play")}</strong><small>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.feedTitle : current ? artist(current) : $t("Music and podcasts, wherever you are")}</small></div>
-      <div class="timeline"><input aria-label={$t("Playback position")} type="range" min="0" max={duration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} disabled={!current && !currentPodcast} /><span>{clock(currentTime)} / {clock(duration)}</span></div>
+      <div class="timeline"><input aria-label={$t("Playback position")} type="range" min={seekStart} max={seekEnd} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} disabled={!canSeek} /><span>{clock(currentTime)} / {duration > 0 ? clock(duration) : '—'}</span></div>
       <div class="player-buttons">
         <button onclick={() => moveTrack(-1)} disabled={activeMedia !== 'music' || playerQueue.length < 2 || (playMode === 'random' && randomHistoryIndex <= 0)} aria-label={$t("Previous track")}>|◀</button>
+        <button class="seek-button" onclick={() => skipSeconds(-15)} disabled={!canSeek} aria-label={$t("Back 15 seconds")} title={$t("Back 15 seconds")}><SeekIcon /></button>
         <button class="play-main" onclick={togglePlayer} aria-label={caching ? $t("Loading audio") : playing ? $t("Pause") : $t("Play")} title={$t("Play / pause (Space)")} disabled={(!current && !currentPodcast) || caching}>{caching ? '···' : playing ? 'Ⅱ' : '▶'}</button>
+        <button class="seek-button" onclick={() => skipSeconds(15)} disabled={!canSeek} aria-label={$t("Forward 15 seconds")} title={$t("Forward 15 seconds")}><SeekIcon forward /></button>
         <button onclick={() => moveTrack(1)} disabled={activeMedia !== 'music' || playerQueue.length < 2} aria-label={$t("Next track")}>▶|</button>
-        <button class="mode-button" class:active={activeMedia === 'music'} onclick={cyclePlayMode} disabled={activeMedia !== 'music'} aria-label={$t(playModeDetails().label)} title={$t(playModeDetails().label)}>{playModeDetails().icon}</button>
+        <button class="like-button player-like" class:liked={playerLiked} disabled={!playerLikeTitle}
+          onclick={() => { if (activeMedia === 'music' && current) toggleTrackLike(current); else if (currentPodcastFeed) togglePodcastLike(currentPodcastFeed); }}
+          aria-pressed={playerLiked} aria-label={$t(playerLiked ? 'Unlike {p0}' : 'Like {p0}', { p0: playerLikeTitle || '' })}
+          title={$t(playerLiked ? 'Unlike {p0}' : 'Like {p0}', { p0: playerLikeTitle || '' })}>{playerLiked ? '♥' : '♡'}</button>
+        <button class="mode-button" class:active={activeMedia === 'music'} onclick={cyclePlayMode} disabled={activeMedia !== 'music'} aria-label={$t(playModeDetails().label)} title={$t(playModeDetails().label)}><span aria-hidden="true">{playModeDetails().icon}</span><span class="mode-label">{$t(playModeDetails().label)}</span></button>
       </div>
       <label class="volume">{$t("Volume")} <input aria-label={$t("Volume")} type="range" min="0" max="1" step="0.02" value={volume} oninput={(event) => setVolume(Number(event.currentTarget.value))} /></label>
+      </div>
     </section>
   </main>
 {/if}
 
 <dialog bind:this={pairingDialog} class="pairing-dialog" aria-labelledby="pairing-heading">
   <h2 id="pairing-heading">{$t("Settings")}</h2>
-  <LanguageSelect />
   {#if status.paired}
+  <LanguageSelect />
   <h3>{$t("Your Napstr connection")}</h3>
   <p class="connected-name">{status.desktopName || 'Napstr'}</p>
   <p>{status.connected ? $t("Connected") : $t("Offline")} · {status.streamOnly ? $t("Read-only access") : $t("Full access")}</p>
@@ -1326,8 +1406,12 @@
   bind:this={audio}
   onplay={() => { playing = true; syncSystemMedia(true); }}
   onpause={() => { playing = false; syncSystemMedia(true); }}
-  ontimeupdate={() => { currentTime = audio.currentTime; syncSystemMedia(); }}
-  ondurationchange={() => { duration = Number.isFinite(audio.duration) ? audio.duration : 0; syncSystemMedia(true); }}
+  ontimeupdate={() => refreshPlaybackTiming()}
+  onloadedmetadata={() => refreshPlaybackTiming(true)}
+  ondurationchange={() => refreshPlaybackTiming(true)}
+  onprogress={() => refreshPlaybackTiming()}
+  oncanplay={() => refreshPlaybackTiming(true)}
+  onplaying={() => refreshPlaybackTiming(true)}
   onended={handleTrackEnded}
   onerror={() => {
     if (activeMedia === 'podcast' && currentPodcast) error = msg("This device could not play {p0}.", { p0: currentPodcast.title });

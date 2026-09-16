@@ -67,12 +67,6 @@ export function template({ slug, language, languages, direction, content, t, cat
     <div class="page-grid">
       <aside class="sidebar">
         <nav aria-label="${t('Main navigation')}">${nav}</nav>
-        <label class="language-select"><span>${t('Language')}</span>
-          <select data-language-select>
-            <option value="auto">${t('Follow system')}</option>
-            ${languages.map(({ code, name }) => `<option value="${code}" lang="${code}"${code === language ? ' selected' : ''}>${escapeHtml(name)}</option>`).join('')}
-          </select>
-        </label>
         <p class="language-suggestion" data-language-suggestion hidden>${t('Language')}: <a data-suggested-language></a></p>
         <details class="language-links">
           <summary>${t('Language')}</summary>

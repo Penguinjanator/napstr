@@ -55,6 +55,16 @@ audio { display: none; }
 .pairing-dialog { width: min(440px, calc(100% - 36px)); padding: 26px; color: #f7f7f8; background: #19191f; border: 1px solid #42414e; border-radius: 18px; box-shadow: 0 24px 100px #0009; }
 .pairing-dialog::backdrop { background: #0009; backdrop-filter: blur(5px); }
 .pairing-dialog h2 { margin-top: 0; font-size: 22px; }
+:root .language-select select { color: #000; background: #f4f4f5; color-scheme: light; }
+.pair-screen > .language-select { position: relative; justify-content: center; max-width: 100%; }
+.player-buttons .seek-button { display: grid; place-items: center; }
+@media (max-width: 799px) {
+  .app-shell { padding-bottom: calc(264px + env(safe-area-inset-bottom)); }
+  .now-playing .now-copy { grid-column: 2 / -1; }
+  .now-playing .player-buttons { grid-column: 1 / -1; grid-row: 2; justify-content: center; gap: 3px; }
+  .now-playing .player-buttons button { width: 44px; height: 44px; flex: 0 0 44px; }
+  .now-playing .timeline { grid-column: 1 / -1; grid-row: 3; }
+}
 .pairing-dialog p { color: #aeacbd; line-height: 1.5; }
 .pairing-dialog .connected-name { color: #e4dfff; font-size: 18px; overflow-wrap: anywhere; }
 .dialog-actions { display: flex; justify-content: space-between; gap: 14px; margin-top: 24px; }
@@ -65,8 +75,8 @@ audio { display: none; }
 /* One navigation and player: their placement follows the available window width. */
 @media (min-width: 600px) {
   .podcast-grid { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 24px; }
-  .app-shell { padding-bottom: calc(204px + env(safe-area-inset-bottom)); }
-  .volume { grid-column: 3; display: flex; align-items: center; gap: 8px; color: #adbcbc; font-size: 11px; }
+  .app-shell { padding-bottom: calc(300px + env(safe-area-inset-bottom)); }
+  .volume { grid-column: 1 / -1; grid-row: 4; display: flex; justify-content: flex-end; align-items: center; gap: 8px; color: #adbcbc; font-size: 11px; }
   .volume input { width: 85px; min-width: 0; accent-color: #b2aaa9; }
 }
 
@@ -74,7 +84,9 @@ audio { display: none; }
   .app-shell { --sidebar-width: 190px; padding: 0 28px 144px calc(var(--sidebar-width) + 28px); }
   .app-header { height: 88px; padding: 20px 0; justify-content: flex-end; }
   .brand { position: fixed; z-index: 4; top: 25px; left: 20px; font-size: 25px; }
-  .brand img { width: 35px; height: 35px; }
+  .brand img { width: 44px; height: 44px; }
+  .pair-logo { width: min(480px, 92vw); }
+  .pair-logo img { width: 128px; height: 128px; }
   .desktop-status { max-width: 80%; padding: 9px 14px; font-size: 12px; }
   .app-nav { top: 88px; right: auto; bottom: 112px; width: var(--sidebar-width); height: auto; padding: 16px 12px; flex-direction: column; justify-content: flex-start; align-items: stretch; gap: 8px; border-top: 0; border-right: 1px solid #26252f; background: #0c0c0f; }
   .app-nav button { min-width: 0; height: 48px; padding: 0 14px; flex-direction: row; justify-content: flex-start; gap: 12px; border-radius: 10px; font-size: 14px; font-weight: 650; }
@@ -102,8 +114,8 @@ audio { display: none; }
   .audiobook-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); align-content: start; gap: 12px 24px; }
   .audiobook-list > .empty-library, .audiobook-list > .loading-list { grid-column: 1 / -1; }
   .error-banner, .notice-banner { width: 100%; margin: 0 0 16px; }
-  .now-playing { inset: auto 0 0; min-height: 112px; padding: 14px 24px; grid-template-columns: 52px minmax(130px, 1fr) minmax(240px, 1.5fr) minmax(120px, .6fr); grid-template-rows: 46px 22px; gap: 4px 16px; border-radius: 0; border-width: 1px 0 0; }
-  .now-playing > .artwork, .now-playing > .empty-art, .now-playing > .podcast-player-art { grid-column: 1; grid-row: 1 / 3; }
+  .now-playing { inset: auto 0 0; min-height: 112px; padding: 14px 24px; grid-template-columns: 52px minmax(130px, 1fr) minmax(270px, 1.5fr) minmax(120px, .6fr); grid-template-rows: 46px 22px; gap: 4px 16px; border-radius: 0; border-width: 1px 0 0; }
+  .now-playing .player-content > .artwork, .now-playing .player-content > .empty-art, .now-playing .player-content > .podcast-player-art { grid-column: 1; grid-row: 1 / 3; }
   .now-copy { grid-column: 2; grid-row: 1 / 3; }
   .player-buttons { grid-column: 3; grid-row: 1; justify-content: center; gap: 12px; }
   .timeline { grid-column: 3; grid-row: 2; }
@@ -136,4 +148,81 @@ audio { display: none; }
   [dir="rtl"] .app-shell { padding-right: calc(var(--sidebar-width) + 28px); padding-left: 28px; }
   [dir="rtl"] .app-nav { right: 0; left: auto; border-right: 0; border-left: 1px solid #26252f; }
   [dir="rtl"] .brand { left: auto; right: 24px; }
+}
+
+
+/* The same player becomes a third desktop column; phones retain the bottom bar. */
+.app-content { min-width: 0; }
+.player-content { display: contents; }
+.player-backdrop { display: none; }
+.player-buttons .player-like, .mode-label { display: none; }
+@media (min-width: 800px) {
+  .app-shell.desktop {
+    --player-width: calc(var(--sidebar-width) * 1.5);
+    display: grid;
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr) var(--player-width);
+    grid-template-rows: 88px minmax(0, 1fr);
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    padding: 0;
+    overflow: hidden;
+  }
+  .desktop .app-header { grid-column: 1 / -1; grid-row: 1; padding: 20px 24px; }
+  .desktop .app-content { grid-column: 2; grid-row: 2; overflow-y: auto; padding: 12px 24px 28px; }
+  .desktop .app-nav { position: static; grid-column: 1; grid-row: 2; width: auto; min-height: 0; overflow-y: auto; }
+  .desktop .now-playing {
+    position: relative;
+    isolation: isolate;
+    grid-column: 3;
+    grid-row: 2;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    gap: 20px;
+    min-width: 0;
+    min-height: 0;
+    padding: 0;
+    overflow: hidden;
+    border: 0;
+    border-inline-start: 1px solid #29383b;
+    background: linear-gradient(165deg, #173437, #10171b 75%);
+    box-shadow: none;
+  }
+  .desktop .player-backdrop { display: block; position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+  .desktop .player-backdrop span { position: absolute; inset: 0; background-size: cover; background-position: center; filter: blur(20px); transform: scale(1.15); }
+  .desktop .player-backdrop::after { content: ''; position: absolute; inset: 0; background: linear-gradient(180deg, #080a1299, #080a12cc 55%, #080a12e0); }
+  .desktop .player-content { position: relative; z-index: 1; display: flex; flex: 1; flex-direction: column; align-items: stretch; gap: 20px; min-height: 0; padding: 24px 20px; overflow-y: auto; }
+  .desktop .player-content > * { flex-shrink: 0; }
+  .desktop .now-playing .player-content > .artwork,
+  .desktop .now-playing .player-content > .empty-art,
+  .desktop .now-playing .player-content > .podcast-player-art {
+    width: 100%;
+    height: auto;
+    aspect-ratio: 1;
+    flex: 0 0 auto;
+    border-radius: 12px;
+    object-fit: cover;
+    box-shadow: 0 18px 36px #0009, 0 4px 10px #0008;
+  }
+  .desktop .now-playing .player-content > .empty-art { font-size: 64px; }
+  .desktop .now-copy { flex: 0 0 auto; }
+  .desktop .now-copy strong { font-size: 20px; white-space: normal; overflow-wrap: anywhere; }
+  .desktop .now-copy small { margin-top: 8px; font-size: 13px; white-space: normal; overflow-wrap: anywhere; }
+  .desktop .timeline { flex-direction: column; align-items: stretch; gap: 8px; }
+  .desktop .timeline input { width: 100%; flex: none; }
+  .desktop .timeline span { text-align: end; font-size: 11px; }
+  .desktop .player-buttons { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 20px 4px; direction: ltr; }
+  .desktop .player-buttons button { width: 100%; min-width: 0; height: 44px; }
+  .desktop .player-buttons .player-like { display: block; grid-row: 2; grid-column: 1; font-size: 26px; }
+  .desktop .player-buttons .mode-button { grid-row: 2; grid-column: 2 / -1; display: flex; align-items: center; justify-content: center; gap: 10px; padding: 0 8px; border-radius: 10px; background: #ffffff09; font-size: 13px; }
+  .desktop .mode-label { display: inline; }
+  .desktop .volume { justify-content: space-between; gap: 12px; flex-wrap: nowrap; }
+  .desktop .volume input { min-width: 0; width: 100%; flex: 1; }
+  .desktop .audiobook-list { grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); }
+  .desktop .track-copy { display: block; }
+  .desktop .track-copy .track-meta { margin-top: 4px; }
+  .desktop .track-open { gap: 10px; }
+  .desktop .track-row { padding-inline: 4px; }
 }

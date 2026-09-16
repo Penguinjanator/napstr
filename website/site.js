@@ -4,7 +4,6 @@ import { loadLatestRelease } from './releases.js';
 const language = document.documentElement.lang;
 const catalog = JSON.parse(document.getElementById('page-translations').textContent);
 export const t = (key, values) => translate({ [language]: catalog }, language, key, values);
-const selector = document.querySelector('[data-language-select]');
 let saved = 'auto';
 try { saved = localStorage.getItem(storageKey) || 'auto'; } catch { /* Session-only choice. */ }
 if (saved !== 'auto' && !languages.some(({ code }) => code === saved)) saved = 'auto';
@@ -19,7 +18,6 @@ function destinationFor(next) {
 
 // Every URL keeps its language, including English and shared legacy links.
 // Detect preferences to suggest a language; navigate only after a user action.
-selector.value = language;
 const suggestion = document.querySelector('[data-language-suggestion]');
 const suggestionLink = document.querySelector('[data-suggested-language]');
 function suggestLanguage() {
@@ -31,12 +29,14 @@ function suggestLanguage() {
   suggestionLink.textContent = languages.find(({ code }) => code === next).name;
 }
 suggestLanguage();
-selector.addEventListener('change', () => {
-  saved = selector.value;
-  try { localStorage.setItem(storageKey, saved); } catch { /* Navigation still works. */ }
-  const next = resolveLanguage(saved, navigator.languages);
-  if (next !== language) location.assign(destinationFor(next).href);
-  else suggestLanguage();
-});
+for (const link of document.querySelectorAll('.language-links a, [data-suggested-language]')) {
+  link.href = destinationFor(link.lang).href;
+  link.addEventListener('click', () => {
+    // Keep normal links usable without JavaScript, including opening new tabs.
+    link.href = destinationFor(link.lang).href;
+    saved = link.lang;
+    try { localStorage.setItem(storageKey, saved); } catch { /* Navigation still works. */ }
+  });
+}
 window.addEventListener('languagechange', suggestLanguage);
 if (document.querySelector('#release-status')) void loadLatestRelease(t, language);

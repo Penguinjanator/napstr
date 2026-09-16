@@ -29,7 +29,8 @@ test('all generated pages keep legacy filenames, valid links, anchors and locali
       const directory = code === 'en' ? output : join(output, code);
       const html = await readFile(join(directory, `${slug}.html`), 'utf8');
       assert.match(html, new RegExp(`<html lang="${code}" dir="${direction(code)}">`));
-      assert.match(html, /data-language-select/);
+      assert.match(html, /<details class="language-links">/);
+      assert.doesNotMatch(html, /data-language-select/);
       assert.equal((html.match(/hreflang=/g) || []).length, 11);
       const canonical = pageUrl(slug, code);
       assert.ok(locations.includes(canonical));

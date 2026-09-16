@@ -155,7 +155,7 @@ for (const platform of ['android', 'linux']) {
     await expect(audio).toHaveAttribute('src', source);
     expect(await page.evaluate(() => window.calls.filter((call) => call.cmd === 'cache_remote_audio').length)).toBe(1);
     if (platform === 'android') {
-      expect(await page.evaluate(() => window.mediaUpdates.at(-1).canSeek)).toBe(true);
+      await expect.poll(() => page.evaluate(() => window.mediaUpdates.at(-1).canSeek)).toBe(true);
       expect(await page.evaluate(() => window.mediaUpdates.at(-1).labels.rewind)).toBe('Back 15 seconds');
     }
     for (const width of [320, 600, 800, 1100]) {
@@ -176,6 +176,102 @@ for (const platform of ['android', 'linux']) {
     await page.screenshot({ path: test.info().outputPath(`${platform}-seek-controls.png`) });
   });
 }
+
+async function instrumentTiming(page) {
+  await page.addInitScript(() => {
+    window.timingStats = { reads: 0, ranges: 0, positions: [], metadata: 0 };
+    window.reportedDuration = NaN;
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'duration');
+    Object.defineProperty(HTMLMediaElement.prototype, 'duration', {
+      configurable: true,
+      get() {
+        window.timingStats.reads++;
+        return window.reportedDuration === 'actual' ? descriptor.get.call(this) : window.reportedDuration;
+      }
+    });
+    Object.defineProperty(HTMLMediaElement.prototype, 'seekable', {
+      configurable: true,
+      get() { window.timingStats.ranges++; throw new Error('Do not query native seekable ranges'); }
+    });
+    Object.defineProperty(navigator.mediaSession, 'metadata', {
+      configurable: true,
+      set() { window.timingStats.metadata++; }
+    });
+    navigator.mediaSession.setPositionState = (state) => window.timingStats.positions.push({ at: Date.now(), state });
+  });
+}
+
+for (const platform of ['android', 'linux']) {
+  test(`Napstrfy ${platform}: late duration recovers without range queries or playback changes`, async ({ page }) => {
+    await mockNative(page, { platform });
+    await instrumentTiming(page);
+    await page.route('**/fixture.wav', serveAudio);
+    await page.goto('http://127.0.0.1:15174');
+    await page.locator('.track-open').first().click();
+    const audio = page.locator('audio');
+    const timeline = page.getByRole('slider', { name: 'Playback position' });
+    await expect.poll(() => audio.evaluate((a) => a.paused)).toBe(false);
+    await page.locator('.play-main').click();
+    await expect(timeline).toBeDisabled();
+    await expect(page.locator('.timeline span')).toContainText('/ —');
+    expect(await page.evaluate(() => window.timingStats.positions.length)).toBe(0);
+    // Duration becomes available without any new metadata event.
+    await page.evaluate(() => { window.reportedDuration = 'actual'; });
+    await expect(timeline).toBeEnabled();
+    await expect(timeline).toHaveAttribute('max', '60');
+    await timeline.fill('30');
+    await page.getByRole('button', { name: 'Forward 15 seconds', exact: true }).click();
+    await expect.poll(() => audio.evaluate((a) => a.currentTime)).toBe(45);
+    expect(await audio.evaluate((a) => a.paused)).toBe(true);
+    await expect.poll(() => page.evaluate(() => window.timingStats.metadata)).toBe(1);
+    const before = await page.evaluate(() => ({ reads: window.timingStats.reads, positions: window.timingStats.positions.length }));
+    const immediate = await page.evaluate(() => {
+      for (let i = 0; i < 10000; i++) {
+        document.querySelector('audio').dispatchEvent(new Event('durationchange'));
+        document.querySelector('audio').dispatchEvent(new Event('loadedmetadata'));
+      }
+      return { reads: window.timingStats.reads, positions: window.timingStats.positions.length };
+    });
+    expect(immediate).toEqual(before);
+    await expect.poll(() => page.evaluate(() => window.timingStats.reads)).toBeGreaterThan(before.reads);
+    const stats = await page.evaluate(() => window.timingStats);
+    expect(stats.reads - before.reads).toBe(1);
+    expect(stats.ranges).toBe(0);
+    expect(stats.metadata).toBe(1);
+    for (let i = 1; i < stats.positions.length; i++) expect(stats.positions[i].at - stats.positions[i - 1].at).toBeGreaterThanOrEqual(990);
+    expect(await page.evaluate(() => window.calls.filter((c) => c.cmd === 'cache_remote_audio').length)).toBe(1);
+  });
+}
+
+test('Napstrfy podcast duration hints stay estimates and cannot enable seeking or reach system controls', async ({ page }) => {
+  await mockNative(page);
+  await instrumentTiming(page);
+  await page.route('**/fixture.wav', serveAudio);
+  await page.goto('http://127.0.0.1:15174');
+  await page.locator('.app-nav button').nth(1).click();
+  await page.locator('.podcast-open').first().click();
+  await page.locator('.episode-copy').first().click();
+  const timeline = page.getByRole('slider', { name: 'Playback position' });
+  await expect.poll(() => page.locator('audio').evaluate((a) => a.paused)).toBe(false);
+  await page.locator('.play-main').click();
+  await expect(timeline).toBeDisabled();
+  await expect(page.locator('.timeline span')).toContainText('/ ≈ 1:40');
+  expect(await page.evaluate(() => window.timingStats.positions.length)).toBe(0);
+  await page.evaluate(() => { window.reportedDuration = Number.MAX_VALUE; document.querySelector('audio').dispatchEvent(new Event('durationchange')); });
+  await expect.poll(() => page.evaluate(() => window.timingStats.reads)).toBeGreaterThan(1);
+  await expect(timeline).toBeDisabled();
+  expect(await page.evaluate(() => window.timingStats.positions.length)).toBe(0);
+  await page.evaluate(() => { window.reportedDuration = 'actual'; document.querySelector('audio').dispatchEvent(new Event('loadedmetadata')); });
+  await expect(timeline).toBeEnabled();
+  await expect(page.locator('.timeline span')).toContainText('/ 1:00');
+  // The next source must not inherit either the estimate or verified length.
+  await page.evaluate(() => { window.reportedDuration = NaN; });
+  await page.locator('.app-nav button').first().click();
+  await page.locator('.track-open').first().click();
+  await expect(timeline).toBeDisabled();
+  await expect(page.locator('.timeline span')).toContainText('/ —');
+  expect(await page.evaluate(() => window.timingStats.ranges)).toBe(0);
+});
 
 test('Napstrfy banners expire after ten seconds and replacement errors get a fresh timer', async ({ page }) => {
   await mockNative(page, { remote: true });

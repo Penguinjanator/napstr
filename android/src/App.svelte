@@ -15,6 +15,7 @@
   } from '@tauri-apps/plugin-barcode-scanner';
   import TrackArtwork from './lib/TrackArtwork.svelte';
   import SeekIcon from './lib/SeekIcon.svelte';
+  import { durationMonitor, rateLimitedTask, validDuration, safePosition } from './lib/playback';
   import appIcon from '../src-tauri/icons/icon.png';
   import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, LibraryPage, PodcastDownload, PodcastEpisode, PodcastFeed, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack, RemoteTransfer } from './lib/types';
 
@@ -81,6 +82,8 @@
   let caching = $state(false);
   let currentTime = $state(0);
   let duration = $state(0);
+  let durationHint = $state(0);
+  const displayedDuration = $derived(duration || durationHint);
   const canSeek = $derived(duration > 0 && !caching);
   let volume = $state(0.85);
   let pending = $state(new Map<string, string>());
@@ -110,7 +113,39 @@
     : Boolean(currentPodcastFeed && isPodcastLiked(currentPodcastFeed)));
   const playerLikeTitle = $derived(activeMedia === 'music' ? current && title(current) : currentPodcastFeed?.title);
   let audio: HTMLAudioElement;
-  let lastSystemMediaSync = 0;
+  let playbackSource = '';
+  let lastSystemMetadata = '';
+  let lastSystemPosition = '';
+  let lastSystemState = '';
+  let lastAndroidState = '';
+  const mediaUpdates = rateLimitedTask(publishSystemMedia);
+  const timing = durationMonitor((value) => {
+    // This callback only changes UI state. System publishing runs independently.
+    duration = value;
+  });
+
+  function resetPlaybackTiming() {
+    timing.stop();
+    playbackSource = '';
+    duration = 0;
+    durationHint = 0;
+    currentTime = 0;
+  }
+
+  function setPlaybackSource(url: string, hint = 0) {
+    resetPlaybackTiming();
+    durationHint = validDuration(hint);
+    audio.src = url;
+    playbackSource = audio.src;
+    const source = playbackSource;
+    timing.start(() => audio.currentSrc === source ? audio.duration : 0);
+  }
+
+  function updatePlaybackPosition() {
+    if (!playbackSource || audio.currentSrc !== playbackSource) return;
+    currentTime = safePosition(audio.currentTime);
+    syncSystemMedia();
+  }
   let currentArtwork = $state('');
   const playerArtwork = $derived(activeMedia === 'podcast' ? currentPodcast?.image || '' : current ? currentArtwork : '');
 
@@ -233,7 +268,7 @@
     playMode = playModes[(index + 1) % playModes.length].value;
     window.localStorage.setItem('napstrfy-play-mode', playMode);
     if (playMode === 'random') resetRandomOrder();
-    syncSystemMedia(true);
+    syncSystemMedia();
   }
 
   function readableSize(size: number) {
@@ -373,6 +408,9 @@
     try {
       await invoke('forget_desktop');
       audio?.pause();
+      resetPlaybackTiming();
+      mediaUpdates.cancel();
+      lastSystemMetadata = lastSystemPosition = lastSystemState = lastAndroidState = '';
       status = { streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' };
       tracks = [];
       current = null;
@@ -533,6 +571,7 @@
   async function playTrack(track: RemoteTrack, libraryVisible = playerQueueLibraryVisible) {
     if (caching) return;
     caching = true;
+    resetPlaybackTiming();
     error = '';
     current = track;
     activeMedia = 'music';
@@ -541,7 +580,7 @@
       const cached = await invoke<CachedAudio>('cache_remote_audio', { track, libraryVisible });
       current = cached.track;
       await tick();
-      audio.src = cached.url;
+      setPlaybackSource(cached.url);
       audio.volume = volume;
       await audio.play();
       playing = true;
@@ -563,6 +602,7 @@
       error = msg("Could not play {p0}: {p1}", { p0: title(track), p1: String(nextError) });
     } finally {
       caching = false;
+      syncSystemMedia();
     }
   }
 
@@ -664,37 +704,62 @@
     else audio.pause();
   }
 
-  function syncSystemMedia(force = false) {
+  function syncSystemMedia() {
+    mediaUpdates.request();
+  }
+
+  function publishSystemMedia() {
     const bridge = androidMediaBridge();
     const media = activeMedia === 'podcast' ? currentPodcast : current;
-    if (!media) return;
-    const now = performance.now();
-    if (!force && now - lastSystemMediaSync < 900) return;
-    lastSystemMediaSync = now;
+    if (!media || caching) return;
     const metadata = {
       title: activeMedia === 'podcast' ? currentPodcast?.title : current ? title(current) : '',
       artist: activeMedia === 'podcast' ? currentPodcast?.feedTitle : current ? artist(current) : '',
       labels: { previous: $t('Previous track'), rewind: $t('Back 15 seconds'), play: $t('Play'), pause: $t('Pause'), forward: $t('Forward 15 seconds'), next: $t('Next track'), channel: $t('Media playback') },
       canSeek,
       playing,
-      position: Number.isFinite(currentTime) ? currentTime : 0,
-      duration: Number.isFinite(duration) ? duration : 0,
+      position: safePosition(currentTime, duration || undefined),
+      duration: validDuration(duration),
       canPrevious: activeMedia === 'music' && playerQueue.length > 1 && (playMode !== 'random' || randomHistoryIndex > 0),
       canNext: activeMedia === 'music' && playerQueue.length > 1
     };
     if (bridge) {
-      bridge.update(JSON.stringify(metadata));
+      const payload = JSON.stringify(metadata);
+      if (payload !== lastAndroidState) {
+        lastAndroidState = payload;
+        bridge.update(payload);
+      }
     } else if ('mediaSession' in navigator) {
       const session = navigator.mediaSession;
-      if (force && 'MediaMetadata' in window) {
-        session.metadata = new MediaMetadata({ title: metadata.title, artist: metadata.artist });
-      }
-      session.playbackState = playing ? 'playing' : 'paused';
       try {
-        if (duration > 0 && Number.isFinite(duration)) {
-          session.setPositionState({ duration, playbackRate: 1, position: Math.min(duration, Math.max(0, currentTime)) });
-        } else {
-          session.setPositionState();
+        // An estimate is for display only. Do not publish unknown or invalid
+        // timing through WebKit's native desktop media conversions.
+        if (!metadata.duration) {
+          if (lastSystemPosition) {
+            lastSystemPosition = '';
+            lastSystemMetadata = '';
+            lastSystemState = '';
+            session.setPositionState();
+            session.metadata = null;
+            session.playbackState = 'none';
+          }
+          return;
+        }
+        const position = { duration: metadata.duration, playbackRate: 1, position: metadata.position };
+        const positionKey = JSON.stringify(position);
+        if (positionKey !== lastSystemPosition) {
+          session.setPositionState(position);
+          lastSystemPosition = positionKey;
+        }
+        const key = JSON.stringify([activeMedia, playbackSource, metadata.title, metadata.artist]);
+        if (key !== lastSystemMetadata && 'MediaMetadata' in window) {
+          session.metadata = new MediaMetadata({ title: metadata.title, artist: metadata.artist });
+          lastSystemMetadata = key;
+        }
+        const state = playing ? 'playing' : 'paused';
+        if (state !== lastSystemState) {
+          session.playbackState = state;
+          lastSystemState = state;
         }
       } catch { /* Some webviews expose only part of Media Session. */ }
     }
@@ -760,11 +825,11 @@
   }
 
   function seek(value: number) {
-    if (!audio || caching || !Number.isFinite(value) || !Number.isFinite(audio.duration) || audio.duration <= 0) return;
-    const target = Math.max(0, Math.min(audio.duration, value));
+    if (!audio || !canSeek || !playbackSource || audio.currentSrc !== playbackSource || !Number.isFinite(value)) return;
+    const target = safePosition(value, duration);
     audio.currentTime = target;
     currentTime = target;
-    syncSystemMedia(true);
+    syncSystemMedia();
   }
 
   function skipSeconds(offset: number) {
@@ -806,7 +871,7 @@
 
   function handleTrackEnded() {
     playing = false;
-    syncSystemMedia(true);
+    syncSystemMedia();
     if (activeMedia !== 'music') return;
     if (playMode === 'once') return;
     if (playMode === 'repeat') {
@@ -1036,6 +1101,7 @@
   async function playPodcast(episode: PodcastEpisode) {
     if (caching) return;
     caching = true;
+    resetPlaybackTiming();
     error = '';
     try {
       audio?.pause();
@@ -1044,7 +1110,7 @@
       currentPodcast = episode;
       currentPodcastFeed = [selectedPodcast, currentPodcastFeed, ...likedPodcasts, ...podcastFeeds]
         .find((feed) => feed?.id === episode.feedId) ?? null;
-      audio.src = source.url;
+      setPlaybackSource(source.url, episode.duration);
       audio.volume = volume;
       await audio.play();
       rememberPodcast(episode);
@@ -1053,6 +1119,7 @@
       error = msg("Could not play {p0}: {p1}", { p0: episode.title, p1: String(nextError) });
     } finally {
       caching = false;
+      syncSystemMedia();
     }
   }
 
@@ -1080,7 +1147,8 @@
   }
 
   onMount(() => initializeLocale(() => osLocale()));
-  $effect(() => { $locale; untrack(() => syncSystemMedia(true)); });
+  $effect(() => { $locale; untrack(() => syncSystemMedia()); });
+  $effect(() => { duration; canSeek; untrack(() => syncSystemMedia()); });
 
   onMount(() => {
     void invoke<string>('client_platform').then((value) => { platform = value; }).catch(() => {});
@@ -1133,6 +1201,8 @@
       document.removeEventListener('visibilitychange', foreground);
       window.removeEventListener('napstrfy-media-action', handleSystemMediaAction);
       window.removeEventListener('keydown', handleKeyboard);
+      timing.stop();
+      mediaUpdates.cancel();
       clearMediaSession();
       androidMediaBridge()?.clear();
     };
@@ -1333,7 +1403,7 @@
         {#if currentPodcast.image}<img class="podcast-player-art" src={currentPodcast.image} alt="" />{:else}<div class="empty-art">◉</div>{/if}
       {:else if current}<TrackArtwork track={current} large lookup onartworkchange={(url) => { currentArtwork = url; }} />{:else}<div class="empty-art">♪</div>{/if}
       <div class="now-copy"><strong>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.title : current ? title(current) : $t("Choose something to play")}</strong><small>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.feedTitle : current ? artist(current) : $t("Music and podcasts, wherever you are")}</small></div>
-      <div class="timeline"><input aria-label={$t("Playback position")} type="range" min="0" max={duration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} disabled={!canSeek} /><span>{clock(currentTime)} / {clock(duration)}</span></div>
+      <div class="timeline"><input aria-label={$t("Playback position")} type="range" min="0" max={displayedDuration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} disabled={!canSeek} /><span>{clock(currentTime)} / {displayedDuration ? `${duration ? '' : '≈ '}${clock(displayedDuration)}` : '—'}</span></div>
       <div class="player-buttons">
         <button onclick={() => moveTrack(-1)} disabled={activeMedia !== 'music' || playerQueue.length < 2 || (playMode === 'random' && randomHistoryIndex <= 0)} aria-label={$t("Previous track")}>|◀</button>
         <button class="seek-button" onclick={() => skipSeconds(-15)} disabled={!canSeek} aria-label={$t("Back 15 seconds")} title={$t("Back 15 seconds")}><SeekIcon /></button>
@@ -1367,10 +1437,11 @@
 
 <audio
   bind:this={audio}
-  onplay={() => { playing = true; syncSystemMedia(true); }}
-  onpause={() => { playing = false; syncSystemMedia(true); }}
-  ontimeupdate={() => { currentTime = audio.currentTime; syncSystemMedia(); }}
-  ondurationchange={() => { duration = Number.isFinite(audio.duration) ? audio.duration : 0; syncSystemMedia(true); }}
+  onplay={() => { playing = true; syncSystemMedia(); }}
+  onpause={() => { playing = false; syncSystemMedia(); }}
+  ontimeupdate={updatePlaybackPosition}
+  onloadedmetadata={() => timing.request()}
+  ondurationchange={() => timing.request()}
   onended={handleTrackEnded}
   onerror={() => {
     if (activeMedia === 'podcast' && currentPodcast) error = msg("This device could not play {p0}.", { p0: currentPodcast.title });

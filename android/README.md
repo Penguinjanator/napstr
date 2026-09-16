@@ -1,8 +1,24 @@
 # Napstrfy
 
-Napstrfy is the Android companion for a running Napstr desktop.
+Napstr's companion player for Android, Windows, Linux, and macOS.
 
-## Requirements
+For desktop pairing, paste the code from Napstr's **Mobile → Pair without a camera**.
+
+## Desktop
+
+From `android/`, with the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) installed:
+
+```sh
+npm ci
+npm run desktop          # Develop
+npm run bundle:windows   # EXE (on Windows)
+npm run bundle:macos     # DMG (on macOS)
+npm run appimage:build   # AppImage (Linux with Docker)
+```
+
+Pushing a `v*` tag attaches all installers and checksums to a draft release.
+
+## Android requirements
 
 - Node.js
 - Rust and Cargo

@@ -24,6 +24,11 @@
     { value: 'once', icon: '▶1', label: 'Play once' }
   ];
   let activeTab = $state<AppTab>('music');
+  let platform = $state('');
+  const mobile = $derived(platform === 'android' || platform === 'ios');
+  let manualPairOpen = $state(true);
+  $effect(() => { manualPairOpen = !mobile; });
+  let pairingDialog: HTMLDialogElement;
   let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' });
   let statusLoading = $state(true);
   let statusPending = $state(false);
@@ -126,7 +131,7 @@
     try {
       window.localStorage.setItem(key, JSON.stringify(value));
     } catch {
-      error = 'Napstrfy could not save that favourite on this phone.';
+      error = 'Napstrfy could not save that favourite on this device.';
     }
   }
 
@@ -283,8 +288,8 @@
     pairing = true;
     error = '';
     try {
-      const platform = /iPhone|iPad|iPod/i.test(navigator.userAgent) ? 'iPhone' : 'Android phone';
-      const desktop = await invoke<string>('pair_desktop', { code: code.trim(), deviceName: `Napstrfy on ${platform}` });
+      const device = ({ android: 'Android', ios: 'iPhone or iPad', windows: 'Windows', macos: 'Mac', linux: 'Linux' } as Record<string, string>)[platform] || 'this device';
+      const desktop = await invoke<string>('pair_desktop', { code: code.trim(), deviceName: `Napstrfy on ${device}` });
       pairingCode = '';
       notice = `Connected to ${desktop}`;
       await refreshStatus();
@@ -297,7 +302,7 @@
   }
 
   async function scanCode() {
-    if (scanning || pairing) return;
+    if (!mobile || scanning || pairing) return;
     error = '';
     cameraPermissionDenied = false;
     scanning = true;
@@ -334,17 +339,35 @@
     try {
       await openAppSettings();
     } catch (nextError) {
-      error = `Could not open Android settings: ${String(nextError)}`;
+      error = `Could not open app settings: ${String(nextError)}`;
     }
   }
 
   async function forgetDesktop() {
-    if (!window.confirm('Disconnect this phone from Napstr? You will need to scan a new QR code.')) return;
-    await invoke('forget_desktop');
-    status = { streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' };
-    tracks = [];
-    current = null;
-    audio?.pause();
+    try {
+      await invoke('forget_desktop');
+      audio?.pause();
+      status = { streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' };
+      tracks = [];
+      current = null;
+      currentPodcast = null;
+      playerQueue = [];
+      activeTab = 'music';
+      androidMediaBridge()?.clear();
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.metadata = null;
+        navigator.mediaSession.playbackState = 'none';
+      }
+      pairingDialog.close();
+    } catch (nextError) {
+      pairingDialog.close();
+      error = String(nextError);
+    }
+  }
+
+  function showPairing() {
+    if (status.paired) pairingDialog.showModal();
+    else activeTab = 'music';
   }
 
   async function loadLibrary(append = false) {
@@ -610,7 +633,7 @@
   }
 
   function togglePlayer() {
-    if (!current && !currentPodcast) return;
+    if ((!current && !currentPodcast) || caching) return;
     if (audio.paused) audio.play().catch((nextError) => (error = String(nextError)));
     else audio.pause();
   }
@@ -618,11 +641,11 @@
   function syncSystemMedia(force = false) {
     const bridge = androidMediaBridge();
     const media = activeMedia === 'podcast' ? currentPodcast : current;
-    if (!bridge || !media) return;
+    if (!media) return;
     const now = performance.now();
     if (!force && now - lastSystemMediaSync < 900) return;
     lastSystemMediaSync = now;
-    bridge.update(JSON.stringify({
+    const metadata = {
       title: activeMedia === 'podcast' ? currentPodcast?.title : current ? title(current) : '',
       artist: activeMedia === 'podcast' ? currentPodcast?.feedTitle : current ? artist(current) : '',
       playing,
@@ -630,7 +653,61 @@
       duration: Number.isFinite(duration) ? duration : 0,
       canPrevious: activeMedia === 'music' && playerQueue.length > 1 && (playMode !== 'random' || randomHistoryIndex > 0),
       canNext: activeMedia === 'music' && playerQueue.length > 1
-    }));
+    };
+    if (bridge) {
+      bridge.update(JSON.stringify(metadata));
+    } else if ('mediaSession' in navigator) {
+      const session = navigator.mediaSession;
+      if (force && 'MediaMetadata' in window) {
+        session.metadata = new MediaMetadata({ title: metadata.title, artist: metadata.artist });
+      }
+      session.playbackState = playing ? 'playing' : 'paused';
+      try {
+        if (duration > 0 && Number.isFinite(duration)) {
+          session.setPositionState({ duration, playbackRate: 1, position: Math.min(duration, Math.max(0, currentTime)) });
+        } else {
+          session.setPositionState();
+        }
+      } catch { /* Some webviews expose only part of Media Session. */ }
+    }
+  }
+
+  function setupMediaSession() {
+    if (androidMediaBridge() || !('mediaSession' in navigator)) return () => {};
+    const handlers: Array<[MediaSessionAction, MediaSessionActionHandler]> = [
+      ['play', () => { if (audio?.paused) togglePlayer(); }],
+      ['pause', () => audio?.pause()],
+      ['previoustrack', () => { void moveTrack(-1); }],
+      ['nexttrack', () => { void moveTrack(1); }],
+      ['seekto', (event) => { if (event.seekTime !== undefined) seek(event.seekTime); }],
+      ['seekbackward', (event) => seek(currentTime - (event.seekOffset ?? 10))],
+      ['seekforward', (event) => seek(currentTime + (event.seekOffset ?? 10))]
+    ];
+    const registered: MediaSessionAction[] = [];
+    for (const [action, handler] of handlers) {
+      try {
+        navigator.mediaSession.setActionHandler(action, handler);
+        registered.push(action);
+      } catch { /* Unsupported actions must not prevent playback. */ }
+    }
+    return () => {
+      for (const action of registered) navigator.mediaSession.setActionHandler(action, null);
+    };
+  }
+
+  function handleKeyboard(event: KeyboardEvent) {
+    if (event.defaultPrevented || event.isComposing || pairingDialog?.open) return;
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'f') {
+      const search = document.querySelector<HTMLInputElement>('.search-area input');
+      if (search) { event.preventDefault(); search.focus(); search.select(); }
+      return;
+    }
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.repeat) return;
+    if (event.target instanceof HTMLElement && event.target.closest('input, textarea, select, button, a, summary, [contenteditable="true"]')) return;
+    if (!current && !currentPodcast) return;
+    if (event.code === 'Space') { event.preventDefault(); togglePlayer(); }
+    else if (event.key === 'ArrowLeft') { event.preventDefault(); seek(currentTime - 10); }
+    else if (event.key === 'ArrowRight') { event.preventDefault(); seek(currentTime + 10); }
   }
 
   function handleSystemMediaAction(event: Event) {
@@ -652,8 +729,9 @@
 
   function seek(value: number) {
     if (!audio || !Number.isFinite(audio.duration)) return;
-    audio.currentTime = value;
-    currentTime = value;
+    audio.currentTime = Math.min(audio.duration, Math.max(0, value));
+    currentTime = audio.currentTime;
+    syncSystemMedia(true);
   }
 
   function setVolume(value: number) {
@@ -965,6 +1043,8 @@
   }
 
   onMount(() => {
+    void invoke<string>('client_platform').then((value) => { platform = value; }).catch(() => {});
+    const clearMediaSession = setupMediaSession();
     const savedPlayMode = window.localStorage.getItem('napstrfy-play-mode');
     if (playModes.some((mode) => mode.value === savedPlayMode)) playMode = savedPlayMode as PlayMode;
     try {
@@ -1005,12 +1085,15 @@
     };
     document.addEventListener('visibilitychange', foreground);
     window.addEventListener('napstrfy-media-action', handleSystemMediaAction);
+    window.addEventListener('keydown', handleKeyboard);
     return () => {
       window.clearInterval(statusTimer);
       window.clearInterval(transferTimer);
       window.clearInterval(podcastTimer);
       document.removeEventListener('visibilitychange', foreground);
       window.removeEventListener('napstrfy-media-action', handleSystemMediaAction);
+      window.removeEventListener('keydown', handleKeyboard);
+      clearMediaSession();
       androidMediaBridge()?.clear();
     };
   });
@@ -1024,25 +1107,30 @@
     <div class="pair-logo" aria-label="Napstrfy"><img src="/favicon.png" alt="" /><span>napstrfy</span></div>
     <p class="eyebrow">NAPSTR COMPANION</p>
     <h1>Your music.<br />Wherever you are.</h1>
-    <p class="pair-copy">Pair securely with Napstr on your computer. Discovery and Tor downloads stay there; your music reaches this phone over encrypted Iroh.</p>
+    <p class="pair-copy">Connect to the computer running Napstr. Browse its library and listen here, with your music sent over an encrypted connection.</p>
     {#if error}
       <div class="error-card">
         <span>{error}</span>
         {#if cameraPermissionDenied}<button onclick={showCameraSettings}>Open app settings</button>{/if}
       </div>
     {/if}
-    <button class="scan-button" onclick={scanCode} disabled={scanning || pairing || statusLoading}><span>▦</span>{scanning ? 'Opening camera…' : pairing ? 'Pairing…' : 'Scan Napstr QR'}</button>
-    <button class="browse-podcasts" onclick={showPodcasts}>Listen to podcasts without pairing</button>
-    <details class="manual-pair">
-      <summary>Enter a pairing code instead</summary>
-      <textarea bind:value={pairingCode} placeholder="napstrfy://pair/…"></textarea>
-      <button onclick={() => pair()} disabled={!pairingCode.trim() || pairing}>Connect</button>
+    {#if mobile}
+      <button class="scan-button" onclick={scanCode} disabled={scanning || pairing || statusLoading}><span>▦</span>{scanning ? 'Opening camera…' : pairing ? 'Pairing…' : 'Scan Napstr QR'}</button>
+    {/if}
+    <details class="manual-pair" class:desktop-pair={!mobile} bind:open={manualPairOpen}>
+      <summary>{mobile ? 'Enter a pairing code instead' : 'Connect with a pairing code'}</summary>
+      <p>On the computer running Napstr, open <strong>Mobile → Pair without a camera</strong>. Copy the code and paste it here within five minutes.</p>
+      <form onsubmit={(event) => { event.preventDefault(); void pair(); }}>
+        <textarea bind:value={pairingCode} aria-label="Napstr pairing code" placeholder="napstrfy://pair/…" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+        <button type="submit" disabled={!pairingCode.trim() || pairing || statusLoading}>{pairing ? 'Connecting…' : 'Connect to Napstr'}</button>
+      </form>
     </details>
+    <button class="browse-podcasts" onclick={showPodcasts}>Listen to podcasts without pairing</button>
     <small class="pair-security">One-use pairing · no Nostr keys leave your computer</small>
   </main>
 {:else}
   <main class="app-shell">
-    <header class="mobile-header">
+    <header class="app-header">
       <div class="brand"><img src="/napstr-logo-small.png" alt="" /><b>napstrfy</b></div>
       {#if status.paired}
         <button class="desktop-status" class:offline={!status.connected} onclick={reconnect}><i></i><span>{statusPending ? 'Connecting…' : status.connected ? status.desktopName || 'Napstr connected' : 'Reconnect'}{status.streamOnly ? ' · Read only' : ''}</span></button>
@@ -1143,7 +1231,7 @@
               <button class:liked={isPodcastLiked(feed)} class="like-button podcast-like" onclick={() => togglePodcastLike(feed)} aria-label={`${isPodcastLiked(feed) ? 'Unlike' : 'Like'} ${feed.title}`}>{isPodcastLiked(feed) ? '♥' : '♡'}</button>
             </article>
           {/each}
-          {#if !podcastLoading && podcastFeeds.length === 0}<div class="empty-library"><h2>{showingLikedPodcasts ? 'No liked podcasts yet' : 'Search podcasts'}</h2><p>{showingLikedPodcasts ? 'Tap the heart beside a podcast to keep it here.' : 'Napstrfy searches podcasts directly over this phone\'s internet connection.'}</p></div>{/if}
+          {#if !podcastLoading && podcastFeeds.length === 0}<div class="empty-library"><h2>{showingLikedPodcasts ? 'No liked podcasts yet' : 'Search podcasts'}</h2><p>{showingLikedPodcasts ? 'Use the heart beside a podcast to keep it here.' : 'Napstrfy searches podcasts directly over this device’s internet connection.'}</p></div>{/if}
         </section>
       {/if}
     {:else}
@@ -1187,11 +1275,11 @@
       {/if}
     {/if}
 
-    <nav class="bottom-nav" aria-label="Napstrfy navigation">
-      <button class:active={activeTab === 'music'} onclick={() => (activeTab = 'music')}><span>♫</span>Music</button>
-      <button class:active={activeTab === 'podcasts'} onclick={showPodcasts}><span>◉</span>Podcasts</button>
-      <button class:active={activeTab === 'audiobooks'} onclick={showAudiobooks}><span>▥</span>Audiobooks</button>
-      <button onclick={() => status.paired ? forgetDesktop() : (activeTab = 'music')}><span>⚙</span>Pairing</button>
+    <nav class="app-nav" aria-label="Napstrfy navigation">
+      <button class:active={activeTab === 'music'} aria-current={activeTab === 'music' ? 'page' : undefined} onclick={() => (activeTab = 'music')}><span aria-hidden="true">♫</span>Music</button>
+      <button class:active={activeTab === 'podcasts'} aria-current={activeTab === 'podcasts' ? 'page' : undefined} onclick={showPodcasts}><span aria-hidden="true">◉</span>Podcasts</button>
+      <button class:active={activeTab === 'audiobooks'} aria-current={activeTab === 'audiobooks' ? 'page' : undefined} onclick={showAudiobooks}><span aria-hidden="true">▥</span>Audiobooks</button>
+      <button onclick={showPairing}><span aria-hidden="true">⚙</span>Pairing</button>
     </nav>
 
     <section class:empty={activeMedia === 'music' ? !current : !currentPodcast} class="now-playing">
@@ -1199,17 +1287,26 @@
         {#if currentPodcast.image}<img class="podcast-player-art" src={currentPodcast.image} alt="" />{:else}<div class="empty-art">◉</div>{/if}
       {:else if current}<TrackArtwork track={current} large lookup />{:else}<div class="empty-art">♪</div>{/if}
       <div class="now-copy"><strong>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.title : current ? title(current) : 'Choose something to play'}</strong><small>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.feedTitle : current ? artist(current) : 'Music and podcasts, wherever you are'}</small></div>
-      <div class="timeline"><input type="range" min="0" max={duration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} disabled={!current && !currentPodcast} /><span>{clock(currentTime)} / {clock(duration)}</span></div>
+      <div class="timeline"><input aria-label="Playback position" type="range" min="0" max={duration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} disabled={!current && !currentPodcast} /><span>{clock(currentTime)} / {clock(duration)}</span></div>
       <div class="player-buttons">
         <button onclick={() => moveTrack(-1)} disabled={activeMedia !== 'music' || playerQueue.length < 2 || (playMode === 'random' && randomHistoryIndex <= 0)} aria-label="Previous track">|◀</button>
-        <button class="play-main" onclick={togglePlayer} disabled={(!current && !currentPodcast) || caching}>{caching ? '···' : playing ? 'Ⅱ' : '▶'}</button>
+        <button class="play-main" onclick={togglePlayer} aria-label={caching ? 'Loading audio' : playing ? 'Pause' : 'Play'} title="Play / pause (Space)" disabled={(!current && !currentPodcast) || caching}>{caching ? '···' : playing ? 'Ⅱ' : '▶'}</button>
         <button onclick={() => moveTrack(1)} disabled={activeMedia !== 'music' || playerQueue.length < 2} aria-label="Next track">▶|</button>
         <button class="mode-button" class:active={activeMedia === 'music'} onclick={cyclePlayMode} disabled={activeMedia !== 'music'} aria-label={playModeDetails().label} title={playModeDetails().label}>{playModeDetails().icon}</button>
       </div>
-      <label class="volume">⌁ <input type="range" min="0" max="1" step="0.02" value={volume} oninput={(event) => setVolume(Number(event.currentTarget.value))} /></label>
+      <label class="volume">Volume <input aria-label="Volume" type="range" min="0" max="1" step="0.02" value={volume} oninput={(event) => setVolume(Number(event.currentTarget.value))} /></label>
     </section>
   </main>
 {/if}
+
+<dialog bind:this={pairingDialog} class="pairing-dialog" aria-labelledby="pairing-heading">
+  <h2 id="pairing-heading">Your Napstr connection</h2>
+  <p class="connected-name">{status.desktopName || 'Napstr'}</p>
+  <p>{status.connected ? 'Connected' : 'Offline'} · {status.streamOnly ? 'Read-only access' : 'Full access'}</p>
+  <p>Napstr must stay running to browse and fetch audio. Cached music can play offline.</p>
+  <p>Disconnecting will require a new pairing code to connect again.</p>
+  <div class="dialog-actions"><button class="disconnect-button" onclick={forgetDesktop}>Disconnect</button><button onclick={() => pairingDialog.close()}>Done</button></div>
+</dialog>
 
 <audio
   bind:this={audio}
@@ -1219,7 +1316,7 @@
   ondurationchange={() => { duration = Number.isFinite(audio.duration) ? audio.duration : 0; syncSystemMedia(true); }}
   onended={handleTrackEnded}
   onerror={() => {
-    if (activeMedia === 'podcast' && currentPodcast) error = `This phone could not play ${currentPodcast.title}.`;
-    else if (current) error = `This phone could not decode ${current.format} audio.`;
+    if (activeMedia === 'podcast' && currentPodcast) error = `This device could not play ${currentPodcast.title}.`;
+    else if (current) error = `This device could not decode ${current.format} audio.`;
   }}
 ></audio>

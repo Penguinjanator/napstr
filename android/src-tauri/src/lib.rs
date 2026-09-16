@@ -2300,6 +2300,11 @@ fn write_private_key(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+fn client_platform() -> &'static str {
+    std::env::consts::OS
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Iroh intentionally uses reqwest's bring-your-own-provider Rustls mode.
@@ -2324,6 +2329,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            client_platform,
             companion_status,
             pair_desktop,
             forget_desktop,

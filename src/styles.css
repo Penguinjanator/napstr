@@ -331,3 +331,18 @@ body.resizing-transfer-pane, body.resizing-transfer-pane * { cursor: ns-resize !
 .chat-block { margin-left: auto; padding: 0 3px; color: #666; background: transparent; border: 0; font-size: 10px; cursor: pointer; }
 
 .mini-cancel { width: 20px; height: 20px; padding: 0; justify-self: end; }
+
+/* Text can expand when translated; keep the existing desktop grid usable. */
+.toolbar { overflow-x: auto; }
+.tool-button { flex-shrink: 0; }
+.search-form { grid-template-columns: auto minmax(120px, 1fr) auto minmax(110px, 140px) auto auto; }
+.search-form label { text-align: end; }
+.settings-view { overflow-y: auto; }
+.settings-view .language-select { display: flex; }
+.settings-view .language-select select { flex: 0 1 230px; }
+html:lang(ar) .app-window, html:lang(ur) .app-window,
+html:lang(hi) .app-window, html:lang(bn) .app-window { line-height: 1.25; }
+[dir="rtl"] .strip-right { margin-left: 0; margin-right: auto; }
+[dir="rtl"] .connection-box, [dir="rtl"] .file-table th, [dir="rtl"] .file-table td { text-align: start; }
+[dir="rtl"] .player-controls, [dir="rtl"] .player-seek, [dir="rtl"] .transfer-actions { direction: ltr; }
+[dir="rtl"] .connection-box .led { margin-right: 0; margin-left: 6px; }

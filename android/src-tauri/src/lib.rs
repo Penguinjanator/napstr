@@ -2313,6 +2313,7 @@ pub fn run() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_os::init())
         .setup(|app| {
             #[cfg(mobile)]
             app.handle().plugin(tauri_plugin_barcode_scanner::init())?;

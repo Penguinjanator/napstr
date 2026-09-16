@@ -2,7 +2,16 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "desktop-capability",
   "description": "Napstrfy desktop companion",
-  "windows": ["main"],
-  "platforms": ["linux", "macOS", "windows"],
-  "permissions": ["core:default"]
+  "windows": [
+    "main"
+  ],
+  "platforms": [
+    "linux",
+    "macOS",
+    "windows"
+  ],
+  "permissions": [
+    "core:default",
+    "os:allow-locale"
+  ]
 }

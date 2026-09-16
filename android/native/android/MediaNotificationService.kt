@@ -19,6 +19,11 @@ class MediaNotificationService : Service() {
   private lateinit var mediaSession: MediaSessionCompat
   private var title = "Napstrfy"
   private var artist = ""
+  private var previousLabel = "Previous"
+  private var playLabel = "Play"
+  private var pauseLabel = "Pause"
+  private var nextLabel = "Next"
+  private var channelLabel = "Media playback"
   private var playing = false
   private var position = 0L
   private var duration = 0L
@@ -75,6 +80,15 @@ class MediaNotificationService : Service() {
     duration = intent.getLongExtra(EXTRA_DURATION, 0L).coerceAtLeast(0L)
     canPrevious = intent.getBooleanExtra(EXTRA_CAN_PREVIOUS, false)
     canNext = intent.getBooleanExtra(EXTRA_CAN_NEXT, false)
+    previousLabel = intent.getStringExtra("label_previous")?.ifBlank { "Previous" } ?: "Previous"
+    playLabel = intent.getStringExtra("label_play")?.ifBlank { "Play" } ?: "Play"
+    pauseLabel = intent.getStringExtra("label_pause")?.ifBlank { "Pause" } ?: "Pause"
+    nextLabel = intent.getStringExtra("label_next")?.ifBlank { "Next" } ?: "Next"
+    val nextChannelLabel = intent.getStringExtra("label_channel")?.ifBlank { "Media playback" } ?: "Media playback"
+    if (nextChannelLabel != channelLabel) {
+      channelLabel = nextChannelLabel
+      createChannel()
+    }
     updateScreenWakeLock()
   }
 
@@ -141,13 +155,13 @@ class MediaNotificationService : Service() {
       .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
       .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
       .setOngoing(playing)
-      .addAction(android.R.drawable.ic_media_previous, "Previous", previous)
+      .addAction(android.R.drawable.ic_media_previous, previousLabel, previous)
       .addAction(
         if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
-        if (playing) "Pause" else "Play",
+        if (playing) pauseLabel else playLabel,
         playPause
       )
-      .addAction(android.R.drawable.ic_media_next, "Next", next)
+      .addAction(android.R.drawable.ic_media_next, nextLabel, next)
       .setStyle(MediaStyle().setMediaSession(mediaSession.sessionToken).setShowActionsInCompactView(0, 1, 2))
       .build()
   }
@@ -176,10 +190,10 @@ class MediaNotificationService : Service() {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
     val channel = NotificationChannel(
       CHANNEL_ID,
-      "Media playback",
+      channelLabel,
       NotificationManager.IMPORTANCE_LOW
     ).apply {
-      description = "Controls for music and podcasts playing in Napstrfy"
+      description = channelLabel
       setShowBadge(false)
     }
     getSystemService(NotificationManager::class.java).createNotificationChannel(channel)

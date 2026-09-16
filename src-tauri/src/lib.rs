@@ -2114,6 +2114,7 @@ pub fn run() {
     let shutdown_services = Arc::new(Mutex::new(None::<ShutdownServices>));
     let setup_shutdown_services = shutdown_services.clone();
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let app_data = app

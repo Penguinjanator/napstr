@@ -3,12 +3,14 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 
 export default defineConfig({
   plugins: [svelte()],
+  resolve: { dedupe: ['svelte'] },
   publicDir: '../static',
   clearScreen: false,
   server: {
     host: '0.0.0.0',
     port: 1421,
-    strictPort: true
+    strictPort: true,
+    fs: { allow: ['..'] }
   },
   envPrefix: ['VITE_', 'TAURI_'],
   build: {

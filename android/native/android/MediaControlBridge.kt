@@ -26,6 +26,10 @@ class MediaControlBridge(private val activity: MainActivity) {
       putExtra(MediaNotificationService.EXTRA_DURATION, state.optDouble("duration").coerceIn(0.0, MAX_SECONDS).toLong() * 1000L)
       putExtra(MediaNotificationService.EXTRA_CAN_PREVIOUS, state.optBoolean("canPrevious"))
       putExtra(MediaNotificationService.EXTRA_CAN_NEXT, state.optBoolean("canNext"))
+      val labels = state.optJSONObject("labels")
+      for (key in listOf("previous", "play", "pause", "next", "channel")) {
+        putExtra("label_$key", safeText(labels?.optString(key).orEmpty(), 100))
+      }
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) activity.startForegroundService(intent)
     else activity.startService(intent)

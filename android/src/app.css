@@ -127,3 +127,13 @@ audio { display: none; }
 @media (max-width: 390px) {
   .track-open { grid-template-columns: 52px minmax(0, 1fr) 25px; gap: 8px; }.artwork { width: 52px; height: 52px; }.now-playing { grid-template-columns: 45px minmax(0, 1fr) auto; }.artwork.large, .empty-art, .podcast-player-art { width: 45px; height: 45px; }.player-buttons button:first-child, .player-buttons button:last-child { width: 27px; }.app-nav { padding-right: 4px; padding-left: 4px; }
 }
+
+.app-nav button { overflow-wrap: anywhere; }
+.pairing-dialog { max-height: calc(100dvh - 32px); overflow-y: auto; }
+[dir="rtl"] .track-copy, [dir="rtl"] .episode-copy, [dir="rtl"] .audiobook-copy { text-align: start; }
+[dir="rtl"] .player-buttons, [dir="rtl"] .timeline { direction: ltr; }
+@media (min-width: 800px) {
+  [dir="rtl"] .app-shell { padding-right: calc(var(--sidebar-width) + 28px); padding-left: 28px; }
+  [dir="rtl"] .app-nav { right: 0; left: auto; border-right: 0; border-left: 1px solid #26252f; }
+  [dir="rtl"] .brand { left: auto; right: 24px; }
+}

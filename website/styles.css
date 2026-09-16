@@ -391,3 +391,14 @@ footer em { display: block; }
   .content-panel { width: 100%; border-radius: 0; }
   .content-body { min-height: auto; }
 }
+
+/* Shared controls also accommodate right-to-left text. */
+.sidebar .language-select { padding: 0 .6rem; font-size: .85rem; }
+.sidebar .language-select select { min-width: 0; width: 100%; }
+.language-suggestion, .language-links { margin: .6rem; font-size: .85rem; }
+.language-suggestion a, .language-links a { color: white; overflow-wrap: anywhere; }
+.language-links summary { cursor: pointer; }
+.language-links a { display: block; margin-block: .4rem; }
+footer nav { display: flex; flex-wrap: wrap; justify-content: center; gap: .8rem; }
+[dir="rtl"] .content-body, [dir="rtl"] .sidebar { text-align: right; }
+.content-body { overflow-wrap: anywhere; }

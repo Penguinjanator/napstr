@@ -1967,9 +1967,10 @@ async fn resolve_catalogue_user(
 
 #[tauri::command]
 async fn get_trollbox_messages(
+    before: Option<network::PublicChatCursor>,
     state: State<'_, AppState>,
 ) -> Result<Vec<network::TrollboxMessage>, String> {
-    state.network.trollbox_messages().await
+    state.network.trollbox_messages(before).await
 }
 
 #[tauri::command]
@@ -1984,11 +1985,12 @@ async fn send_trollbox_message(
 async fn get_track_discussion_messages(
     file_id: String,
     subscribe: bool,
+    before: Option<network::PublicChatCursor>,
     state: State<'_, AppState>,
 ) -> Result<Vec<network::TrollboxMessage>, String> {
     state
         .network
-        .track_discussion_messages(file_id, subscribe)
+        .track_discussion_messages(file_id, subscribe, before)
         .await
 }
 

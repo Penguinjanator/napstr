@@ -71,6 +71,8 @@ audio { display: none; }
 .dialog-actions button { padding: 11px 20px; background: #343044; border: 1px solid #5a546f; border-radius: 22px; }
 .dialog-actions .disconnect-button { color: #ffc7cc; background: #362025; border-color: #693840; }
 .track-list > .empty-library, .track-list > .loading-list, .load-more { grid-column: 1 / -1; }
+.track-list > .network-search-status { min-height: 48px; display: flex; justify-content: center; }
+.network-search-status i { width: 16px; height: 16px; border-width: 2px; }
 
 /* One navigation and player: their placement follows the available window width. */
 @media (min-width: 600px) {

@@ -16,6 +16,16 @@ npm run bundle:macos     # DMG (on macOS)
 npm run appimage:build   # AppImage (Linux with Docker)
 ```
 
+On NixOS, run from the repository root:
+
+```sh
+nix develop --command npm --prefix android run desktop
+```
+
+The development shell includes the GStreamer plugins WebKit needs for audio
+playback. After changing the shell dependencies, stop the running client and
+run this command again to load the updated environment.
+
 Pushing a `v*` tag attaches all installers to a draft release. GitHub displays a SHA-256 checksum for each installer.
 
 ## Android requirements

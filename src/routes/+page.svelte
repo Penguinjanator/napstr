@@ -14,6 +14,7 @@
   let appVersion = '…';
   const SEARCH_PAGE_SIZE = 100;
   const LOCAL_PAGE_SIZE = 100;
+  const CHAT_PAGE_SIZE = 100;
   const VISIBLE_SEEDER_LIMIT = 100;
 
   type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Mobile';
@@ -144,6 +145,7 @@
   let trollboxError: string | Message = '';
   let trollboxPollPending = false;
   let trollboxRefreshAgain = false;
+  let trollboxHasMore = true;
   let mobileStatusValue: MobileStatus | null = null;
   let mobilePairing: MobilePairingOffer | null = null;
   let mobileStreamPairing: MobilePairingOffer | null = null;
@@ -160,6 +162,9 @@
   let trackDiscussionError = '';
   let trackDiscussionPollPending = false;
   let trackDiscussionRefreshAgain = false;
+  let trackDiscussionSubscribeAgain = false;
+  let trackDiscussionHasMore = true;
+  let trackDiscussionGeneration = 0;
   let trackDiscussionLog: HTMLDivElement;
   let searchAction: 'search' | 'surprise' | null = null;
   let browseCursor: CatalogueBrowseCursor | null = null;
@@ -916,24 +921,52 @@
     return colours[(hash >>> 0) % colours.length];
   }
 
-  async function refreshTrollbox() {
-    if (!nativeReady || !networkConnected) return;
+  function mergeChatMessages(current: TrollboxMessage[], incoming: TrollboxMessage[]) {
+    return [...new Map([...current, ...incoming].map((message) => [message.eventId, message])).values()]
+      .sort((a, b) => a.createdAt - b.createdAt || a.eventId.localeCompare(b.eventId));
+  }
+
+  function openChatLog(node: HTMLDivElement) {
+    let alive = true;
+    void tick().then(() => { if (alive) node.scrollTop = node.scrollHeight; });
+    return { destroy() { alive = false; } };
+  }
+
+  function chatScrollRestorer(node: HTMLDivElement | undefined, initial: boolean, older: boolean) {
+    if (!node) return () => {};
+    const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 40;
+    if (initial || (!older && atBottom)) return () => { node.scrollTop = node.scrollHeight; };
+    // Keep the same visible message in place, including if the user moved while
+    // the network request was pending or a loading notice changes height.
+    const anchor = [...node.querySelectorAll<HTMLElement>('.trollbox-message')]
+      .find((item) => item.getBoundingClientRect().bottom > node.getBoundingClientRect().top);
+    const offset = anchor ? anchor.getBoundingClientRect().top - node.getBoundingClientRect().top : 0;
+    return () => {
+      if (anchor?.isConnected) node.scrollTop += anchor.getBoundingClientRect().top - node.getBoundingClientRect().top - offset;
+    };
+  }
+
+  async function refreshTrollbox(older = false) {
+    if (!nativeReady || !networkConnected || (older && (!trollboxHasMore || !trollboxMessages.length))) return;
     if (trollboxPollPending) {
-      trollboxRefreshAgain = true;
+      if (!older) trollboxRefreshAgain = true;
       return;
     }
     trollboxPollPending = true;
-    trollboxLoading = trollboxMessages.length === 0;
-    const stayAtBottom = !trollboxLog || trollboxLog.scrollHeight - trollboxLog.scrollTop - trollboxLog.clientHeight < 45;
+    const initial = trollboxMessages.length === 0;
+    trollboxLoading = initial || older;
+    const first = trollboxMessages[0];
     try {
-      const messages = await invoke<TrollboxMessage[]>('get_trollbox_messages');
-      const changed = messages.length !== trollboxMessages.length || messages.at(-1)?.eventId !== trollboxMessages.at(-1)?.eventId;
-      trollboxMessages = messages;
+      const messages = await invoke<TrollboxMessage[]>('get_trollbox_messages', {
+        before: older ? { createdAt: first.createdAt, eventId: first.eventId } : null
+      });
+      const restoreScroll = chatScrollRestorer(trollboxLog, initial, older);
+      trollboxMessages = mergeChatMessages(trollboxMessages, messages);
+      if (older) trollboxHasMore = messages.length === CHAT_PAGE_SIZE;
       trollboxError = '';
-      if (changed && stayAtBottom) {
-        await tick();
-        trollboxLog?.scrollTo({ top: trollboxLog.scrollHeight });
-      }
+      trollboxLoading = false;
+      await tick();
+      restoreScroll();
     } catch (error) {
       trollboxError = String(error);
     } finally {
@@ -1045,6 +1078,7 @@
     selected = item;
     if (changed || !preserveSelection) selectedSource = 0;
     if (!item || item.audiobook) {
+      trackDiscussionGeneration += 1;
       trackDiscussionFileId = '';
       trackDiscussionMessages = [];
       trackDiscussionDraft = '';
@@ -1113,41 +1147,54 @@
     }
   }
 
-  async function refreshTrackDiscussion(fileId = selected?.fileId ?? '', subscribe = false) {
+  async function refreshTrackDiscussion(fileId = selected?.fileId ?? '', subscribe = false, older = false) {
     if (!fileId || !nativeReady || !networkConnected) return;
     if (trackDiscussionFileId !== fileId) {
+      trackDiscussionGeneration += 1;
       trackDiscussionFileId = fileId;
       trackDiscussionMessages = [];
       trackDiscussionDraft = '';
       trackDiscussionError = '';
+      trackDiscussionHasMore = true;
+      trackDiscussionPollPending = false;
+      trackDiscussionRefreshAgain = false;
+      trackDiscussionSubscribeAgain = false;
       subscribe = true;
     }
-    if (trackDiscussionPollPending && !subscribe) {
-      trackDiscussionRefreshAgain = true;
+    if (older && (!trackDiscussionHasMore || !trackDiscussionMessages.length)) return;
+    if (trackDiscussionPollPending) {
+      if (!older) trackDiscussionRefreshAgain = true;
+      if (subscribe) trackDiscussionSubscribeAgain = true;
       return;
     }
+    const generation = trackDiscussionGeneration;
     trackDiscussionPollPending = true;
-    trackDiscussionLoading = trackDiscussionMessages.length === 0;
-    const stayAtBottom = !trackDiscussionLog || trackDiscussionLog.scrollHeight - trackDiscussionLog.scrollTop - trackDiscussionLog.clientHeight < 35;
+    const initial = trackDiscussionMessages.length === 0;
+    trackDiscussionLoading = initial || older;
+    const first = trackDiscussionMessages[0];
     try {
-      const messages = await invoke<TrollboxMessage[]>('get_track_discussion_messages', { fileId, subscribe });
-      if (selected?.fileId !== fileId || trackDiscussionFileId !== fileId) return;
-      const changed = messages.length !== trackDiscussionMessages.length || messages.at(-1)?.eventId !== trackDiscussionMessages.at(-1)?.eventId;
-      trackDiscussionMessages = messages;
+      const messages = await invoke<TrollboxMessage[]>('get_track_discussion_messages', {
+        fileId, subscribe, before: older ? { createdAt: first.createdAt, eventId: first.eventId } : null
+      });
+      if (generation !== trackDiscussionGeneration || selected?.fileId !== fileId) return;
+      const restoreScroll = chatScrollRestorer(trackDiscussionLog, initial, older);
+      trackDiscussionMessages = mergeChatMessages(trackDiscussionMessages, messages);
+      if (older) trackDiscussionHasMore = messages.length === CHAT_PAGE_SIZE;
       trackDiscussionError = '';
-      if (changed && stayAtBottom) {
-        await tick();
-        trackDiscussionLog?.scrollTo({ top: trackDiscussionLog.scrollHeight });
-      }
+      trackDiscussionLoading = false;
+      await tick();
+      if (generation === trackDiscussionGeneration) restoreScroll();
     } catch (error) {
-      if (selected?.fileId === fileId) trackDiscussionError = String(error);
+      if (generation === trackDiscussionGeneration) trackDiscussionError = String(error);
     } finally {
-      if (selected?.fileId === fileId) {
+      if (generation === trackDiscussionGeneration) {
         trackDiscussionLoading = false;
         trackDiscussionPollPending = false;
         if (trackDiscussionRefreshAgain) {
+          const subscribeAgain = trackDiscussionSubscribeAgain;
           trackDiscussionRefreshAgain = false;
-          void refreshTrackDiscussion(fileId);
+          trackDiscussionSubscribeAgain = false;
+          void refreshTrackDiscussion(fileId, subscribeAgain);
         }
       }
     }
@@ -2399,9 +2446,9 @@
               {#if !isLocalFile(selected.fileId)}<div class="detail-actions moderation-actions"><button class="classic-button" onclick={blockSelectedFile}>{$t("Block file")}</button><button class="classic-button" onclick={blockSelectedUser}>{$t("Block user")}</button></div>{/if}
               {#if !isLocalFile(selected.fileId)}<p class="privacy-note"><span>♜</span> {$t("Transfer will use the seeder’s private, app-session Tor onion service.")}</p>{:else}<p class="privacy-note"><span>♬</span> {$t("Downloaded and verified · ready to play from your Napstr folder.")}</p>{/if}
               <section class="track-discussion" aria-label={$t("Discussion for {p0}", { p0: selected.name })}>
-                <div class="track-discussion-title"><b>{$t("Track discussion")}</b><small>{$t("Public · Nostr")}</small></div>
-                <div class="track-discussion-log" bind:this={trackDiscussionLog} aria-live="polite">
-                  {#if trackDiscussionLoading}<p class="trollbox-notice">{$t("Loading comments…")}</p>{/if}
+                <div class="track-discussion-title"><b>{$t("Track discussion")}</b><small>{$t(trackDiscussionLoading ? "Loading…" : "Public · Nostr")}</small></div>
+                <div class="track-discussion-log" use:openChatLog bind:this={trackDiscussionLog} aria-live="polite" aria-busy={trackDiscussionLoading} onscroll={(event) => { if (event.currentTarget.scrollTop < 32) void refreshTrackDiscussion(selected?.fileId, false, true); }}>
+                  {#if trackDiscussionLoading && !trackDiscussionMessages.length}<p class="trollbox-notice">{$t("Loading comments…")}</p>{/if}
                   {#if !trackDiscussionLoading && trackDiscussionMessages.length === 0 && !trackDiscussionError}<p class="trollbox-notice">{$t("No comments yet.")}</p>{/if}
                   {#each trackDiscussionMessages as message (message.eventId)}
                     <div class="trollbox-message"><button class="trollbox-name" style:color={chatNameColor(message.npub)} title={$t("Browse songs shared by {p0} · {p1}", { p0: message.displayName, p1: message.npub })} onclick={() => browseUser(message)}>{message.displayName}:</button><span>{message.content}</span>{#if message.npub !== identityNpub}<button class="chat-block" aria-label={$t("Block {p0}", { p0: message.displayName })} onclick={() => blockTrollboxUser(message)}>{$t("Block")}</button>{/if}</div>
@@ -2480,9 +2527,9 @@
       {:else if activeView === 'Trollbox'}
         <section class="full-panel trollbox-view">
           <div class="panel-title"><span></span><b>{$t("Napstr Trollbox")}</b><span></span></div>
-          <div class="trollbox-status"><span><i class:amber={!networkConnected} class="led"></i> {$t("Public Nostr chat:")} <b>#napstr-trollbox</b></span><small>{$t("NIP-C7 messages are public and signed by your Napstr Nostr identity.")}</small></div>
-          <div class="trollbox-log" bind:this={trollboxLog} aria-live="polite" aria-label={$t("Napstr public chat messages")}>
-            {#if trollboxLoading}<p class="trollbox-notice">{$t("Connecting to the trollbox…")}</p>{/if}
+          <div class="trollbox-status"><span><i class:amber={!networkConnected} class="led"></i> {$t("Public Nostr chat:")} <b>#napstr-trollbox</b></span><small>{$t(trollboxLoading ? "Loading…" : "NIP-C7 messages are public and signed by your Napstr Nostr identity.")}</small></div>
+          <div class="trollbox-log" use:openChatLog bind:this={trollboxLog} aria-live="polite" aria-busy={trollboxLoading} onscroll={(event) => { if (event.currentTarget.scrollTop < 32) void refreshTrollbox(true); }} aria-label={$t("Napstr public chat messages")}>
+            {#if trollboxLoading && !trollboxMessages.length}<p class="trollbox-notice">{$t("Connecting to the trollbox…")}</p>{/if}
             {#if !trollboxLoading && trollboxMessages.length === 0 && !trollboxError}<p class="trollbox-notice">{$t("No messages yet. Say hello.")}</p>{/if}
             {#each trollboxMessages as message (message.eventId)}
               <div class="trollbox-message"><button class="trollbox-name" style:color={chatNameColor(message.npub)} title={$t("Browse songs shared by {p0} · {p1}", { p0: message.displayName, p1: message.npub })} onclick={() => browseUser(message)}>{message.displayName}:</button><span>{message.content}</span>{#if message.npub !== identityNpub}<button class="chat-block" aria-label={$t("Block {p0}", { p0: message.displayName })} onclick={() => blockTrollboxUser(message)}>{$t("Block")}</button>{/if}</div>
@@ -2576,10 +2623,10 @@
       <div class="dock-title"><span></span><b>{$t("Transfer Manager")}</b><span></span><button class="dock-clear" onclick={clearFinishedTransfers} disabled={clearingTransfers || !transfers.some(isFinishedTransfer)}>{$t("Clear finished")}</button><button class="dock-clear" onclick={clearAllTransfers} disabled={clearingTransfers || removingTransfers.size > 0 || (!transfers.length && !audiobookDownloads.length && !startingDownloads.size)}>{clearingTransfers ? $t("Clearing…") : $t("Clear all")}</button><button onclick={() => (activeView = 'Downloads')} title={$t("Open Download Manager")}>□</button></div>
       <div class="mini-transfers">
         {#each audiobookDownloads as book}
-          <div class="mini-row audiobook-mini-row"><span class="audiobook-glyph">▥</span><span class="mini-name">{book.title} {$t("· chapter")} {Math.min(book.nextIndex + 1, book.chapters.length)} {$t("of")} {book.chapters.length}</span><div class="progress"><span style={`width:${book.chapters.length ? (book.nextIndex / book.chapters.length) * 100 : 0}%`}></span></div><span>{readableSize(book.chapters.reduce((sum, chapter) => sum + chapter.size, 0))}</span><span>{$t("Book")}</span></div>
+          <div class="mini-row audiobook-mini-row"><span class="audiobook-glyph">▥</span><span class="mini-name">{book.title} {$t("· chapter")} {Math.min(book.nextIndex + 1, book.chapters.length)} {$t("of")} {book.chapters.length}</span><div class="progress"><span style={`width:${book.chapters.length ? (book.nextIndex / book.chapters.length) * 100 : 0}%`}></span></div><span class="mini-size">{readableSize(book.chapters.reduce((sum, chapter) => sum + chapter.size, 0))}</span><span class="mini-status">{$t("Book")}</span></div>
         {/each}
         {#each transfers as transfer}
-          <div class:transfer-complete={isCompleteTransfer(transfer)} class="mini-row">{#if isCompleteTransfer(transfer)}<button class="mini-play" onclick={() => playAudio(transfer.fileId, transfer.name, playerMode, 'downloads')} title={$t("Play verified audio")}>▶</button>{:else}<span class="download-arrow">⇩</span>{/if}<span class="mini-name">{transfer.name}</span><div class="progress"><span style={`width:${transfer.progress}%`}></span></div><span>{transfer.size}</span><span>{isCompleteTransfer(transfer) ? $t("Ready") : transfer.speed}</span><button class="tiny-button mini-cancel" onclick={() => removeTransfer(transfer.id)} disabled={clearingTransfers || removingTransfers.has(transfer.id)} aria-label={`${isActiveTransfer(transfer) ? 'Cancel download' : 'Clear entry'}: ${transfer.name}`} title={isActiveTransfer(transfer) ? $t("Cancel download and remove partial file") : $t("Clear entry; keep completed audio")}>×</button></div>
+          <div class:transfer-complete={isCompleteTransfer(transfer)} class="mini-row">{#if isCompleteTransfer(transfer)}<button class="mini-play" onclick={() => playAudio(transfer.fileId, transfer.name, playerMode, 'downloads')} title={$t("Play verified audio")}>▶</button>{:else}<span class="download-arrow">⇩</span>{/if}<span class="mini-name">{transfer.name}</span><div class="progress"><span style={`width:${transfer.progress}%`}></span></div><span class="mini-size">{transfer.size}</span><span class="mini-status" title={isCompleteTransfer(transfer) ? $t("Ready") : transfer.status}>{isCompleteTransfer(transfer) ? $t("Ready") : transfer.speed}</span><button class="tiny-button mini-cancel" onclick={() => removeTransfer(transfer.id)} disabled={clearingTransfers || removingTransfers.has(transfer.id)} aria-label={`${isActiveTransfer(transfer) ? 'Cancel download' : 'Clear entry'}: ${transfer.name}`} title={isActiveTransfer(transfer) ? $t("Cancel download and remove partial file") : $t("Clear entry; keep completed audio")}>×</button></div>
         {/each}
       </div>
     </section>

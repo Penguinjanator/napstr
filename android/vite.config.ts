@@ -10,6 +10,8 @@ export default defineConfig({
     host: '0.0.0.0',
     port: 1421,
     strictPort: true,
+    // Tauri watches native code; generated native builds can exhaust file watchers.
+    watch: { ignored: ['**/src-tauri/**', '**/.cache/**'] },
     fs: { allow: ['..'] }
   },
   envPrefix: ['VITE_', 'TAURI_'],
@@ -19,4 +21,3 @@ export default defineConfig({
     sourcemap: Boolean(process.env.TAURI_ENV_DEBUG)
   }
 });
-

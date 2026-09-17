@@ -64,6 +64,7 @@
   let total = $state(0);
   let loading = $state(false);
   let loadingMore = $state(false);
+  let searchingNetwork = $state(false);
   let musicViewVersion = 0;
   let loadedLibraryRevision = 0;
   let silentLibraryRefresh = false;
@@ -235,6 +236,7 @@
 
   function showLikedTracks() {
     musicViewVersion += 1;
+    searchingNetwork = false;
     showingLikedMusic = !showingLikedMusic;
     if (!showingLikedMusic) {
       void searchTracks(query);
@@ -407,6 +409,8 @@
   async function forgetDesktop() {
     try {
       await invoke('forget_desktop');
+      musicViewVersion += 1;
+      loading = loadingMore = searchingNetwork = false;
       audio?.pause();
       resetPlaybackTiming();
       mediaUpdates.cancel();
@@ -435,8 +439,10 @@
   }
 
   async function loadLibrary(append = false) {
-    if (!status.paired || loading || loadingMore) return;
+    if (!status.paired || (append && (loading || loadingMore))) return;
     const viewVersion = ++musicViewVersion;
+    searchingNetwork = false;
+    if (!append) loadingMore = false;
     showingLikedMusic = false;
     append ? (loadingMore = true) : (loading = true);
     error = '';
@@ -469,8 +475,10 @@
       return;
     }
     silentLibraryRefresh = true;
+    const viewVersion = musicViewVersion;
     try {
       const page = await invoke<LibraryPage>('remote_library', { query: '', offset: 0, limit: 100 });
+      if (viewVersion !== musicViewVersion) return;
       tracks = page.tracks;
       total = page.total;
       loadedLibraryRevision = revision;
@@ -486,21 +494,42 @@
     query = nextQuery;
     showingLikedMusic = false;
     if (!query.trim()) return loadLibrary();
-    if (loading) return;
     const viewVersion = ++musicViewVersion;
+    const searchQuery = query.trim();
     loading = true;
+    loadingMore = false;
+    searchingNetwork = !status.streamOnly;
+    tracks = [];
+    total = 0;
+    selected = null;
     error = '';
-    try {
-      const results = await invoke<RemoteTrack[]>('remote_search', { query: query.trim() });
+    const mergeResults = (results: RemoteTrack[]) => {
       if (viewVersion !== musicViewVersion) return;
-      tracks = results;
+      const merged = new Map(tracks.map((track) => [track.fileId, track]));
+      for (const track of results) {
+        // A network response must not downgrade a track already on the host.
+        if (!merged.get(track.fileId)?.local || track.local) merged.set(track.fileId, track);
+      }
+      tracks = [...merged.values()].sort((left, right) => Number(right.local) - Number(left.local));
       total = tracks.length;
-      selected = tracks[0] ?? null;
-    } catch (nextError) {
+      selected = tracks.find((track) => track.fileId === selected?.fileId) ?? tracks[0] ?? null;
+    };
+    const failed = (nextError: unknown) => {
       if (viewVersion === musicViewVersion) error = String(nextError);
-    } finally {
-      if (viewVersion === musicViewVersion) loading = false;
-    }
+    };
+    // Separate Iroh requests let host-library results arrive without waiting
+    // for Nostr. Both use existing endpoints, including on older hosts.
+    const localSearch = invoke<LibraryPage>('remote_library', { query: searchQuery, offset: 0, limit: 200 })
+      .then((page) => mergeResults(page.tracks))
+      .catch(failed)
+      .finally(() => { if (viewVersion === musicViewVersion) loading = false; });
+    const networkSearch = searchingNetwork
+      ? invoke<RemoteTrack[]>('remote_search', { query: searchQuery })
+        .then(mergeResults)
+        .catch(failed)
+        .finally(() => { if (viewVersion === musicViewVersion) searchingNetwork = false; })
+      : Promise.resolve();
+    await Promise.all([localSearch, networkSearch]);
   }
 
   async function showAudiobooks() {
@@ -1268,9 +1297,9 @@
         <span>{$t("Tracks: {count}", { count: total })}</span>
       </section>
 
-      <section class="track-list" aria-busy={loading}>
-        {#if loading}<div class="loading-list"><i></i><span>{$t("Asking Napstr…")}</span></div>{/if}
-        {#if !loading && tracks.length === 0}<div class="empty-library"><img src={appIcon} alt="" /><h2>{showingLikedMusic ? $t("No liked tracks yet") : $t("No tracks found")}</h2><p>{showingLikedMusic ? $t("Tap the heart beside a song to keep it here.") : query ? $t("Try different words or clear the search.") : $t("Add music to your Napstr folder on the computer.")}</p></div>{/if}
+      <section class="track-list" aria-busy={loading || searchingNetwork}>
+        {#if loading && tracks.length === 0}<div class="loading-list"><i></i><span>{$t("Asking Napstr…")}</span></div>{/if}
+        {#if !loading && !searchingNetwork && tracks.length === 0}<div class="empty-library"><img src={appIcon} alt="" /><h2>{showingLikedMusic ? $t("No liked tracks yet") : $t("No tracks found")}</h2><p>{showingLikedMusic ? $t("Tap the heart beside a song to keep it here.") : query ? $t("Try different words or clear the search.") : $t("Add music to your Napstr folder on the computer.")}</p></div>{/if}
         {#each tracks as track (track.fileId)}
           <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class="track-row">
             <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
@@ -1285,6 +1314,7 @@
             <button class:liked={isTrackLiked(track)} class="like-button" onclick={() => toggleTrackLike(track)} aria-label={$t(isTrackLiked(track) ? 'Unlike {p0}' : 'Like {p0}', { p0: title(track) })}>{isTrackLiked(track) ? '♥' : '♡'}</button>
           </div>
         {/each}
+        {#if searchingNetwork && (!loading || tracks.length > 0)}<div class="loading-list network-search-status" role="status"><i></i><span>{$t("Searching")}…</span></div>{/if}
         {#if !showingLikedMusic && tracks.length < total}<button class="load-more" onclick={() => loadLibrary(true)} disabled={loadingMore}>{loadingMore ? $t("Loading…") : $t("Load more · {p0} of {p1}", { p0: tracks.length, p1: total })}</button>{/if}
       </section>
     {:else if activeTab === 'podcasts'}

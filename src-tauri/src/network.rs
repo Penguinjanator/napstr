@@ -31,6 +31,7 @@ const TRACK_DISCUSSION_SUBSCRIPTION: &str = "napstr-track-discussion";
 const PUBLIC_CHAT_EVENT: &str = "napstr-public-chat";
 const TRANSFERS_CHANGED_EVENT: &str = "napstr-transfers-changed";
 const TROLLBOX_CACHE_LIMIT: usize = 200;
+const PUBLIC_CHAT_PAGE_SIZE: usize = 100;
 const LIVE_NOSTR_EVENT_LIMIT: usize = 35_000;
 const MAX_SEEDER_CANDIDATES: usize = 3;
 const DOWNLOAD_QUEUED: &str = "Queued";
@@ -195,6 +196,13 @@ pub struct TrollboxMessage {
     pub display_name: String,
     pub content: String,
     pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicChatCursor {
+    created_at: u64,
+    event_id: EventId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1262,25 +1270,25 @@ impl NetworkService {
         self.publish_profile_with_client(&client, public_key).await
     }
 
-    pub async fn trollbox_messages(&self) -> Result<Vec<TrollboxMessage>, String> {
+    pub async fn trollbox_messages(
+        &self,
+        before: Option<PublicChatCursor>,
+    ) -> Result<Vec<TrollboxMessage>, String> {
         let client = self
             .client
             .read()
             .await
             .clone()
             .ok_or("Nostr is not connected")?;
-        self.public_chat_messages(
-            &client,
-            trollbox_filter(TROLLBOX_CACHE_LIMIT),
-            TROLLBOX_HASHTAG,
-        )
-        .await
+        self.public_chat_messages(&client, TROLLBOX_HASHTAG, before)
+            .await
     }
 
     pub async fn track_discussion_messages(
         &self,
         file_id: String,
         subscribe: bool,
+        before: Option<PublicChatCursor>,
     ) -> Result<Vec<TrollboxMessage>, String> {
         let topic = track_discussion_topic(&file_id)?;
         let client = self
@@ -1301,40 +1309,58 @@ impl NetworkService {
                 .await
                 .map_err(|error| format!("track discussion subscription failed: {error}"))?;
         }
-        self.public_chat_messages(&client, public_chat_filter(&topic, 100), &topic)
-            .await
+        self.public_chat_messages(&client, &topic, before).await
     }
 
     async fn public_chat_messages(
         &self,
         client: &Client,
-        filter: Filter,
         topic: &str,
+        before: Option<PublicChatCursor>,
     ) -> Result<Vec<TrollboxMessage>, String> {
+        let mut filter = public_chat_filter(topic, LIVE_NOSTR_EVENT_LIMIT);
+        if let Some(cursor) = &before {
+            filter = filter.until(Timestamp::from(cursor.created_at));
+        }
         let events = client
             .database()
-            .query(filter)
+            .query(filter.clone())
             .await
             .map_err(|error| format!("could not read the public chat cache: {error}"))?;
         let blocked = blocked_pubkeys(&self.db_path)?;
-        let mut chat_events = events
+        let mut available = events
             .iter()
-            .filter(|event| {
-                event.kind == Kind::from(TROLLBOX_MESSAGE_KIND)
-                    && event
-                        .tags
-                        .iter()
-                        .any(|tag| tag.kind() == TagKind::t() && tag.content() == Some(topic))
-                    && !blocked.contains(&event.pubkey.to_hex())
-                    && !event.content.trim().is_empty()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        chat_events.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.id.cmp(&right.id))
-        });
+            .map(|event| (event.id, event.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut chat_events =
+            public_chat_page(available.values(), topic, &blocked, before.as_ref());
+        // Live subscriptions only retain a recent window. Retrieve older history
+        // from relays when the user reaches the end of the locally cached page.
+        if before.is_some() && chat_events.len() < PUBLIC_CHAT_PAGE_SIZE {
+            let mut limit = PUBLIC_CHAT_PAGE_SIZE * 2;
+            loop {
+                let older = client
+                    .fetch_events(filter.clone().limit(limit), Duration::from_secs(8))
+                    .await
+                    .map_err(|error| format!("could not load older chat messages: {error}"))?;
+                let received = older.len();
+                for event in older.iter() {
+                    let _ = client.database().save_event(event).await;
+                    available.insert(event.id, event.clone());
+                }
+                chat_events =
+                    public_chat_page(available.values(), topic, &blocked, before.as_ref());
+                if chat_events.len() == PUBLIC_CHAT_PAGE_SIZE
+                    || received < limit
+                    || limit == LIVE_NOSTR_EVENT_LIMIT
+                {
+                    break;
+                }
+                // Nostr's `until` is inclusive and only has second precision.
+                // Widen the window if boundary-second or blocked events filled it.
+                limit = (limit * 2).min(LIVE_NOSTR_EVENT_LIMIT);
+            }
+        }
 
         let current_key = self
             .keys
@@ -2925,6 +2951,33 @@ fn exclude_local_availability(
     available.retain(|file_id, _| !local.contains(file_id));
     online.retain(|(_, file_id)| !local.contains(file_id));
     Ok(())
+}
+
+fn public_chat_page<'a>(
+    events: impl Iterator<Item = &'a Event>,
+    topic: &str,
+    blocked: &HashSet<String>,
+    before: Option<&PublicChatCursor>,
+) -> Vec<Event> {
+    let mut events = events
+        .filter(|event| {
+            event.kind == Kind::from(TROLLBOX_MESSAGE_KIND)
+                && event
+                    .tags
+                    .iter()
+                    .any(|tag| tag.kind() == TagKind::t() && tag.content() == Some(topic))
+                && !blocked.contains(&event.pubkey.to_hex())
+                && !sanitise_public_chat_content(&event.content).is_empty()
+                && before.is_none_or(|cursor| {
+                    (event.created_at.as_secs(), event.id) < (cursor.created_at, cursor.event_id)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| std::cmp::Reverse((event.created_at, event.id)));
+    events.truncate(PUBLIC_CHAT_PAGE_SIZE);
+    events.reverse();
+    events
 }
 
 fn trollbox_filter(limit: usize) -> Filter {
@@ -4633,6 +4686,62 @@ mod tests {
         .sign_with_keys(&keys)
         .unwrap();
         assert!(!valid_audiobook_event(&unsafe_event, &unsafe_content));
+    }
+
+    #[test]
+    fn public_chat_pages_keep_same_second_messages_without_duplicates_or_gaps() {
+        let keys = Keys::generate();
+        let blocked_keys = Keys::generate();
+        let blocked = HashSet::from([blocked_keys.public_key().to_hex()]);
+        for topic in [
+            TROLLBOX_HASHTAG.to_owned(),
+            track_discussion_topic(&"ab".repeat(32)).unwrap(),
+        ] {
+            let mut events = (0..250)
+                .map(|index| {
+                    EventBuilder::new(
+                        Kind::from(TROLLBOX_MESSAGE_KIND),
+                        format!("message {index}"),
+                    )
+                    .tag(Tag::hashtag(&topic))
+                    .custom_created_at(Timestamp::from(if index < 230 { 100 } else { 200 }))
+                    .sign_with_keys(&keys)
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            for index in 0..110 {
+                events.push(
+                    EventBuilder::new(
+                        Kind::from(TROLLBOX_MESSAGE_KIND),
+                        format!("blocked {index}"),
+                    )
+                    .tag(Tag::hashtag(&topic))
+                    .custom_created_at(Timestamp::from(300))
+                    .sign_with_keys(&blocked_keys)
+                    .unwrap(),
+                );
+            }
+            let mut cursor = None;
+            let mut seen = HashSet::new();
+            for expected in [100, 100, 50, 0] {
+                let page = public_chat_page(events.iter(), &topic, &blocked, cursor.as_ref());
+                assert_eq!(page.len(), expected);
+                assert!(page.windows(2).all(
+                    |pair| (pair[0].created_at, pair[0].id) < (pair[1].created_at, pair[1].id)
+                ));
+                for event in &page {
+                    assert!(seen.insert(event.id));
+                    assert_eq!(event.pubkey, keys.public_key());
+                }
+                if let Some(first) = page.first() {
+                    cursor = Some(PublicChatCursor {
+                        created_at: first.created_at.as_secs(),
+                        event_id: first.id,
+                    });
+                }
+            }
+            assert_eq!(seen.len(), 250);
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
 import android.support.v4.media.MediaMetadataCompat
@@ -19,11 +20,19 @@ class MediaNotificationService : Service() {
   private lateinit var mediaSession: MediaSessionCompat
   private var title = "Napstrfy"
   private var artist = ""
+  private var previousLabel = "Previous"
+  private var playLabel = "Play"
+  private var pauseLabel = "Pause"
+  private var nextLabel = "Next"
+  private var rewindLabel = "Back 15 seconds"
+  private var forwardLabel = "Forward 15 seconds"
+  private var channelLabel = "Media playback"
   private var playing = false
   private var position = 0L
   private var duration = 0L
   private var canPrevious = false
   private var canNext = false
+  private var canSeek = false
   private var foregroundStarted = false
   private var screenWakeLock: PowerManager.WakeLock? = null
 
@@ -36,8 +45,13 @@ class MediaNotificationService : Service() {
         override fun onPause() = dispatch(ACTION_PAUSE)
         override fun onSkipToPrevious() = dispatch(ACTION_PREVIOUS)
         override fun onSkipToNext() = dispatch(ACTION_NEXT)
+        override fun onRewind() = dispatch(ACTION_REWIND)
+        override fun onFastForward() = dispatch(ACTION_FORWARD)
+        override fun onCustomAction(action: String?, extras: Bundle?) {
+          if (action == ACTION_REWIND || action == ACTION_FORWARD) dispatch(action)
+        }
         override fun onSeekTo(pos: Long) {
-          MediaControlBridge.dispatch("seek:${pos.coerceAtLeast(0L)}")
+          if (canSeek) MediaControlBridge.dispatch("seek:${pos.coerceAtLeast(0L)}")
         }
       })
       isActive = true
@@ -53,7 +67,7 @@ class MediaNotificationService : Service() {
         stopSelf()
         return START_NOT_STICKY
       }
-      ACTION_PLAY, ACTION_PAUSE, ACTION_PREVIOUS, ACTION_NEXT -> {
+      ACTION_PLAY, ACTION_PAUSE, ACTION_PREVIOUS, ACTION_NEXT, ACTION_REWIND, ACTION_FORWARD -> {
         dispatch(intent.action!!)
         return START_NOT_STICKY
       }
@@ -75,6 +89,18 @@ class MediaNotificationService : Service() {
     duration = intent.getLongExtra(EXTRA_DURATION, 0L).coerceAtLeast(0L)
     canPrevious = intent.getBooleanExtra(EXTRA_CAN_PREVIOUS, false)
     canNext = intent.getBooleanExtra(EXTRA_CAN_NEXT, false)
+    canSeek = intent.getBooleanExtra(EXTRA_CAN_SEEK, false)
+    previousLabel = intent.getStringExtra("label_previous")?.ifBlank { "Previous" } ?: "Previous"
+    playLabel = intent.getStringExtra("label_play")?.ifBlank { "Play" } ?: "Play"
+    pauseLabel = intent.getStringExtra("label_pause")?.ifBlank { "Pause" } ?: "Pause"
+    nextLabel = intent.getStringExtra("label_next")?.ifBlank { "Next" } ?: "Next"
+    rewindLabel = intent.getStringExtra("label_rewind")?.ifBlank { "Back 15 seconds" } ?: "Back 15 seconds"
+    forwardLabel = intent.getStringExtra("label_forward")?.ifBlank { "Forward 15 seconds" } ?: "Forward 15 seconds"
+    val nextChannelLabel = intent.getStringExtra("label_channel")?.ifBlank { "Media playback" } ?: "Media playback"
+    if (nextChannelLabel != channelLabel) {
+      channelLabel = nextChannelLabel
+      createChannel()
+    }
     updateScreenWakeLock()
   }
 
@@ -108,13 +134,21 @@ class MediaNotificationService : Service() {
     )
     var actions = PlaybackStateCompat.ACTION_PLAY or
       PlaybackStateCompat.ACTION_PAUSE or
-      PlaybackStateCompat.ACTION_PLAY_PAUSE or
-      PlaybackStateCompat.ACTION_SEEK_TO
+      PlaybackStateCompat.ACTION_PLAY_PAUSE
+    if (canSeek) actions = actions or PlaybackStateCompat.ACTION_SEEK_TO or
+      PlaybackStateCompat.ACTION_REWIND or PlaybackStateCompat.ACTION_FAST_FORWARD
     if (canPrevious) actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
     if (canNext) actions = actions or PlaybackStateCompat.ACTION_SKIP_TO_NEXT
     mediaSession.setPlaybackState(
       PlaybackStateCompat.Builder()
         .setActions(actions)
+        .apply {
+          // Android 13+ derives lock-screen buttons from session custom actions.
+          if (canSeek) {
+            addCustomAction(ACTION_REWIND, rewindLabel, R.drawable.ic_replay_15)
+            addCustomAction(ACTION_FORWARD, forwardLabel, R.drawable.ic_forward_15)
+          }
+        }
         .setState(
           if (playing) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED,
           position,
@@ -128,6 +162,8 @@ class MediaNotificationService : Service() {
     val previous = actionPendingIntent(ACTION_PREVIOUS, 1)
     val playPause = actionPendingIntent(if (playing) ACTION_PAUSE else ACTION_PLAY, 2)
     val next = actionPendingIntent(ACTION_NEXT, 3)
+    val rewind = if (canSeek) actionPendingIntent(ACTION_REWIND, 4) else null
+    val forward = if (canSeek) actionPendingIntent(ACTION_FORWARD, 5) else null
     val launch = packageManager.getLaunchIntentForPackage(packageName)?.let {
       PendingIntent.getActivity(this, 0, it, pendingFlags())
     }
@@ -141,14 +177,16 @@ class MediaNotificationService : Service() {
       .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
       .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
       .setOngoing(playing)
-      .addAction(android.R.drawable.ic_media_previous, "Previous", previous)
+      .addAction(android.R.drawable.ic_media_previous, previousLabel, previous)
+      .addAction(R.drawable.ic_replay_15, rewindLabel, rewind)
       .addAction(
         if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
-        if (playing) "Pause" else "Play",
+        if (playing) pauseLabel else playLabel,
         playPause
       )
-      .addAction(android.R.drawable.ic_media_next, "Next", next)
-      .setStyle(MediaStyle().setMediaSession(mediaSession.sessionToken).setShowActionsInCompactView(0, 1, 2))
+      .addAction(R.drawable.ic_forward_15, forwardLabel, forward)
+      .addAction(android.R.drawable.ic_media_next, nextLabel, next)
+      .setStyle(MediaStyle().setMediaSession(mediaSession.sessionToken).setShowActionsInCompactView(1, 2, 3))
       .build()
   }
 
@@ -169,6 +207,8 @@ class MediaNotificationService : Service() {
       ACTION_PAUSE -> MediaControlBridge.dispatch("pause")
       ACTION_PREVIOUS -> if (canPrevious) MediaControlBridge.dispatch("previous")
       ACTION_NEXT -> if (canNext) MediaControlBridge.dispatch("next")
+      ACTION_REWIND -> if (canSeek) MediaControlBridge.dispatch("rewind")
+      ACTION_FORWARD -> if (canSeek) MediaControlBridge.dispatch("forward")
     }
   }
 
@@ -176,10 +216,10 @@ class MediaNotificationService : Service() {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
     val channel = NotificationChannel(
       CHANNEL_ID,
-      "Media playback",
+      channelLabel,
       NotificationManager.IMPORTANCE_LOW
     ).apply {
-      description = "Controls for music and podcasts playing in Napstrfy"
+      description = channelLabel
       setShowBadge(false)
     }
     getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
@@ -208,6 +248,8 @@ class MediaNotificationService : Service() {
     const val ACTION_PAUSE = "net.napstr.nostrfy.media.PAUSE"
     const val ACTION_PREVIOUS = "net.napstr.nostrfy.media.PREVIOUS"
     const val ACTION_NEXT = "net.napstr.nostrfy.media.NEXT"
+    const val ACTION_REWIND = "net.napstr.nostrfy.media.REWIND"
+    const val ACTION_FORWARD = "net.napstr.nostrfy.media.FORWARD"
     const val EXTRA_TITLE = "title"
     const val EXTRA_ARTIST = "artist"
     const val EXTRA_PLAYING = "playing"
@@ -215,6 +257,7 @@ class MediaNotificationService : Service() {
     const val EXTRA_DURATION = "duration"
     const val EXTRA_CAN_PREVIOUS = "canPrevious"
     const val EXTRA_CAN_NEXT = "canNext"
+    const val EXTRA_CAN_SEEK = "canSeek"
     private const val CHANNEL_ID = "napstrfy_playback"
     private const val NOTIFICATION_ID = 7302
   }

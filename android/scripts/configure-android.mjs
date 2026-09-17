@@ -82,10 +82,9 @@ await writeFile(
 );
 const drawableDirectory = resolve(main, 'res/drawable');
 await mkdir(drawableDirectory, { recursive: true });
-await copyFile(
-  resolve(native, 'ic_stat_napstrfy.xml'),
-  resolve(drawableDirectory, 'ic_stat_napstrfy.xml'),
-);
+for (const filename of ['ic_stat_napstrfy.xml', 'ic_replay_15.xml', 'ic_forward_15.xml']) {
+  await copyFile(resolve(native, filename), resolve(drawableDirectory, filename));
+}
 await writeFile(
   resolve(xmlDirectory, 'backup_rules.xml'),
   `<?xml version="1.0" encoding="utf-8"?>

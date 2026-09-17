@@ -1,5 +1,10 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { t, locale, message as msg, initializeLocale, type Message } from '@napstr/i18n/svelte';
+  import LanguageSelect from '@napstr/i18n/LanguageSelect.svelte';
+  import { readStoredPreference } from '@napstr/i18n';
+  import { locale as osLocale } from '@tauri-apps/plugin-os';
+  import '@napstr/i18n/styles.css';
+  import { onMount, tick, untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import {
     Format,
@@ -9,6 +14,9 @@
     scan
   } from '@tauri-apps/plugin-barcode-scanner';
   import TrackArtwork from './lib/TrackArtwork.svelte';
+  import SeekIcon from './lib/SeekIcon.svelte';
+  import { durationMonitor, rateLimitedTask, validDuration, safePosition } from './lib/playback';
+  import appIcon from '../src-tauri/icons/icon.png';
   import type { AudiobookLibraryPage, CachedAudio, CompanionStatus, LibraryPage, PodcastDownload, PodcastEpisode, PodcastFeed, RemoteAudiobook, RemoteAudiobookSummary, RemoteTrack, RemoteTransfer } from './lib/types';
 
   const musicChips = ['Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat'];
@@ -24,6 +32,11 @@
     { value: 'once', icon: '▶1', label: 'Play once' }
   ];
   let activeTab = $state<AppTab>('music');
+  let platform = $state('');
+  const mobile = $derived(platform === 'android' || platform === 'ios');
+  let manualPairOpen = $state(true);
+  $effect(() => { manualPairOpen = !mobile; });
+  let pairingDialog: HTMLDialogElement;
   let status = $state<CompanionStatus>({ streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' });
   let statusLoading = $state(true);
   let statusPending = $state(false);
@@ -31,8 +44,19 @@
   let pairing = $state(false);
   let scanning = $state(false);
   let cameraPermissionDenied = $state(false);
-  let error = $state('');
-  let notice = $state('');
+  let error = $state<string | Message>('');
+  let notice = $state<string | Message>('');
+  $effect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => { notice = ''; }, 10_000);
+    return () => window.clearTimeout(timer);
+  });
+  $effect(() => {
+    // Pairing errors can contain a camera-permission action; keep those visible.
+    if (!error || (!status.paired && activeTab !== 'podcasts')) return;
+    const timer = window.setTimeout(() => { error = ''; }, 10_000);
+    return () => window.clearTimeout(timer);
+  });
   let query = $state('');
   let tracks = $state<RemoteTrack[]>([]);
   let likedMusic = $state<RemoteTrack[]>([]);
@@ -40,6 +64,7 @@
   let total = $state(0);
   let loading = $state(false);
   let loadingMore = $state(false);
+  let searchingNetwork = $state(false);
   let musicViewVersion = 0;
   let loadedLibraryRevision = 0;
   let silentLibraryRefresh = false;
@@ -58,6 +83,9 @@
   let caching = $state(false);
   let currentTime = $state(0);
   let duration = $state(0);
+  let durationHint = $state(0);
+  const displayedDuration = $derived(duration || durationHint);
+  const canSeek = $derived(duration > 0 && !caching);
   let volume = $state(0.85);
   let pending = $state(new Map<string, string>());
   let pendingAudiobooks = $state(new Map<string, string>());
@@ -79,9 +107,48 @@
   let podcastLoading = $state(false);
   let podcastViewVersion = 0;
   let currentPodcast = $state<PodcastEpisode | null>(null);
+  let currentPodcastFeed = $state<PodcastFeed | null>(null);
   let activeMedia = $state<'music' | 'podcast'>('music');
+  const playerLiked = $derived(activeMedia === 'music'
+    ? Boolean(current && isTrackLiked(current))
+    : Boolean(currentPodcastFeed && isPodcastLiked(currentPodcastFeed)));
+  const playerLikeTitle = $derived(activeMedia === 'music' ? current && title(current) : currentPodcastFeed?.title);
   let audio: HTMLAudioElement;
-  let lastSystemMediaSync = 0;
+  let playbackSource = '';
+  let lastSystemMetadata = '';
+  let lastSystemPosition = '';
+  let lastSystemState = '';
+  let lastAndroidState = '';
+  const mediaUpdates = rateLimitedTask(publishSystemMedia);
+  const timing = durationMonitor((value) => {
+    // This callback only changes UI state. System publishing runs independently.
+    duration = value;
+  });
+
+  function resetPlaybackTiming() {
+    timing.stop();
+    playbackSource = '';
+    duration = 0;
+    durationHint = 0;
+    currentTime = 0;
+  }
+
+  function setPlaybackSource(url: string, hint = 0) {
+    resetPlaybackTiming();
+    durationHint = validDuration(hint);
+    audio.src = url;
+    playbackSource = audio.src;
+    const source = playbackSource;
+    timing.start(() => audio.currentSrc === source ? audio.duration : 0);
+  }
+
+  function updatePlaybackPosition() {
+    if (!playbackSource || audio.currentSrc !== playbackSource) return;
+    currentTime = safePosition(audio.currentTime);
+    syncSystemMedia();
+  }
+  let currentArtwork = $state('');
+  const playerArtwork = $derived(activeMedia === 'podcast' ? currentPodcast?.image || '' : current ? currentArtwork : '');
 
   type AndroidMediaBridge = {
     update(payload: string): void;
@@ -97,7 +164,7 @@
   }
 
   function artist(track: RemoteTrack) {
-    return track.artist || 'Unknown artist';
+    return track.artist || $t('Unknown artist');
   }
 
   function isStoredTrack(value: unknown): value is RemoteTrack {
@@ -126,7 +193,7 @@
     try {
       window.localStorage.setItem(key, JSON.stringify(value));
     } catch {
-      error = 'Napstrfy could not save that favourite on this phone.';
+      error = msg("Napstrfy could not save that favourite on this device.");
     }
   }
 
@@ -169,6 +236,7 @@
 
   function showLikedTracks() {
     musicViewVersion += 1;
+    searchingNetwork = false;
     showingLikedMusic = !showingLikedMusic;
     if (!showingLikedMusic) {
       void searchTracks(query);
@@ -202,7 +270,7 @@
     playMode = playModes[(index + 1) % playModes.length].value;
     window.localStorage.setItem('napstrfy-play-mode', playMode);
     if (playMode === 'random') resetRandomOrder();
-    syncSystemMedia(true);
+    syncSystemMedia();
   }
 
   function readableSize(size: number) {
@@ -283,10 +351,10 @@
     pairing = true;
     error = '';
     try {
-      const platform = /iPhone|iPad|iPod/i.test(navigator.userAgent) ? 'iPhone' : 'Android phone';
-      const desktop = await invoke<string>('pair_desktop', { code: code.trim(), deviceName: `Napstrfy on ${platform}` });
+      const device = ({ android: 'Android', ios: 'iPhone or iPad', windows: 'Windows', macos: 'Mac', linux: 'Linux' } as Record<string, string>)[platform] || 'this device';
+      const desktop = await invoke<string>('pair_desktop', { code: code.trim(), deviceName: `Napstrfy on ${device}` });
       pairingCode = '';
-      notice = `Connected to ${desktop}`;
+      notice = msg("Connected to {p0}", { p0: desktop });
       await refreshStatus();
       await loadLibrary();
     } catch (nextError) {
@@ -297,7 +365,7 @@
   }
 
   async function scanCode() {
-    if (scanning || pairing) return;
+    if (!mobile || scanning || pairing) return;
     error = '';
     cameraPermissionDenied = false;
     scanning = true;
@@ -306,7 +374,7 @@
       if (permission !== 'granted') permission = await requestPermissions();
       if (permission !== 'granted') {
         cameraPermissionDenied = true;
-        error = 'Camera access is required to scan the Napstr pairing code.';
+        error = msg("Camera access is required to scan the Napstr pairing code.");
         return;
       }
 
@@ -322,8 +390,8 @@
       if (!/cancel/i.test(message)) {
         cameraPermissionDenied = /permission/i.test(message);
         error = cameraPermissionDenied
-          ? 'Camera access is required to scan the Napstr pairing code.'
-          : `Could not open the QR scanner: ${message}`;
+          ? msg("Camera access is required to scan the Napstr pairing code.")
+          : msg("Could not open the QR scanner: {p0}", { p0: message });
       }
     } finally {
       scanning = false;
@@ -334,22 +402,47 @@
     try {
       await openAppSettings();
     } catch (nextError) {
-      error = `Could not open Android settings: ${String(nextError)}`;
+      error = msg("Could not open app settings: {p0}", { p0: String(nextError) });
     }
   }
 
   async function forgetDesktop() {
-    if (!window.confirm('Disconnect this phone from Napstr? You will need to scan a new QR code.')) return;
-    await invoke('forget_desktop');
-    status = { streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' };
-    tracks = [];
-    current = null;
-    audio?.pause();
+    try {
+      await invoke('forget_desktop');
+      musicViewVersion += 1;
+      loading = loadingMore = searchingNetwork = false;
+      audio?.pause();
+      resetPlaybackTiming();
+      mediaUpdates.cancel();
+      lastSystemMetadata = lastSystemPosition = lastSystemState = lastAndroidState = '';
+      status = { streamOnly: false, paired: false, connected: false, desktopName: '', endpointId: '', libraryRevision: 0, error: '' };
+      tracks = [];
+      current = null;
+      currentPodcast = null;
+      playerQueue = [];
+      activeTab = 'music';
+      androidMediaBridge()?.clear();
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.metadata = null;
+        navigator.mediaSession.playbackState = 'none';
+      }
+      pairingDialog.close();
+    } catch (nextError) {
+      pairingDialog.close();
+      error = String(nextError);
+    }
+  }
+
+  function showPairing() {
+    if (!status.paired) { activeTab = 'music'; return; }
+    pairingDialog.showModal();
   }
 
   async function loadLibrary(append = false) {
-    if (!status.paired || loading || loadingMore) return;
+    if (!status.paired || (append && (loading || loadingMore))) return;
     const viewVersion = ++musicViewVersion;
+    searchingNetwork = false;
+    if (!append) loadingMore = false;
     showingLikedMusic = false;
     append ? (loadingMore = true) : (loading = true);
     error = '';
@@ -382,8 +475,10 @@
       return;
     }
     silentLibraryRefresh = true;
+    const viewVersion = musicViewVersion;
     try {
       const page = await invoke<LibraryPage>('remote_library', { query: '', offset: 0, limit: 100 });
+      if (viewVersion !== musicViewVersion) return;
       tracks = page.tracks;
       total = page.total;
       loadedLibraryRevision = revision;
@@ -399,21 +494,42 @@
     query = nextQuery;
     showingLikedMusic = false;
     if (!query.trim()) return loadLibrary();
-    if (loading) return;
     const viewVersion = ++musicViewVersion;
+    const searchQuery = query.trim();
     loading = true;
+    loadingMore = false;
+    searchingNetwork = !status.streamOnly;
+    tracks = [];
+    total = 0;
+    selected = null;
     error = '';
-    try {
-      const results = await invoke<RemoteTrack[]>('remote_search', { query: query.trim() });
+    const mergeResults = (results: RemoteTrack[]) => {
       if (viewVersion !== musicViewVersion) return;
-      tracks = results;
+      const merged = new Map(tracks.map((track) => [track.fileId, track]));
+      for (const track of results) {
+        // A network response must not downgrade a track already on the host.
+        if (!merged.get(track.fileId)?.local || track.local) merged.set(track.fileId, track);
+      }
+      tracks = [...merged.values()].sort((left, right) => Number(right.local) - Number(left.local));
       total = tracks.length;
-      selected = tracks[0] ?? null;
-    } catch (nextError) {
+      selected = tracks.find((track) => track.fileId === selected?.fileId) ?? tracks[0] ?? null;
+    };
+    const failed = (nextError: unknown) => {
       if (viewVersion === musicViewVersion) error = String(nextError);
-    } finally {
-      if (viewVersion === musicViewVersion) loading = false;
-    }
+    };
+    // Separate Iroh requests let host-library results arrive without waiting
+    // for Nostr. Both use existing endpoints, including on older hosts.
+    const localSearch = invoke<LibraryPage>('remote_library', { query: searchQuery, offset: 0, limit: 200 })
+      .then((page) => mergeResults(page.tracks))
+      .catch(failed)
+      .finally(() => { if (viewVersion === musicViewVersion) loading = false; });
+    const networkSearch = searchingNetwork
+      ? invoke<RemoteTrack[]>('remote_search', { query: searchQuery })
+        .then(mergeResults)
+        .catch(failed)
+        .finally(() => { if (viewVersion === musicViewVersion) searchingNetwork = false; })
+      : Promise.resolve();
+    await Promise.all([localSearch, networkSearch]);
   }
 
   async function showAudiobooks() {
@@ -484,6 +600,7 @@
   async function playTrack(track: RemoteTrack, libraryVisible = playerQueueLibraryVisible) {
     if (caching) return;
     caching = true;
+    resetPlaybackTiming();
     error = '';
     current = track;
     activeMedia = 'music';
@@ -492,7 +609,7 @@
       const cached = await invoke<CachedAudio>('cache_remote_audio', { track, libraryVisible });
       current = cached.track;
       await tick();
-      audio.src = cached.url;
+      setPlaybackSource(cached.url);
       audio.volume = volume;
       await audio.play();
       playing = true;
@@ -511,9 +628,10 @@
       }
     } catch (nextError) {
       playing = false;
-      error = `Could not play ${title(track)}: ${String(nextError)}`;
+      error = msg("Could not play {p0}: {p1}", { p0: title(track), p1: String(nextError) });
     } finally {
       caching = false;
+      syncSystemMedia();
     }
   }
 
@@ -531,7 +649,7 @@
     audiobookId: string | null = null
   ) {
     if (status.streamOnly) {
-      error = 'This pairing is read only. It cannot ask Napstr to download songs.';
+      error = msg("This pairing is read only. It cannot ask Napstr to download songs.");
       return;
     }
     if (pending.has(track.fileId)) return;
@@ -544,7 +662,7 @@
         sourcePubkeys: track.sources.map((source) => source.pubkey),
         destinationFolder
       });
-      notice = `Napstr is downloading ${title(track)} over Tor`;
+      notice = msg("Napstr is downloading {p0} over Tor", { p0: title(track) });
       await refreshTransfers();
     } catch (nextError) {
       const next = new Map(pending);
@@ -571,7 +689,7 @@
           const nextAudiobooks = new Map(pendingAudiobooks);
           nextAudiobooks.delete(pendingFileId);
           pendingAudiobooks = nextAudiobooks;
-          error = `${transfer.filename}: ${transfer.status}`;
+          error = msg("{p0}: {p1}", { p0: transfer.filename, p1: transfer.status });
           continue;
         }
         if (transfer && transfer.progress < 100 && !/complete|verified/i.test(transfer.status)) continue;
@@ -604,33 +722,114 @@
         const nextAudiobooks = new Map(pendingAudiobooks);
         nextAudiobooks.delete(pendingFileId);
         pendingAudiobooks = nextAudiobooks;
-        notice = `${title(local)} is ready to play`;
+        notice = msg("{p0} is ready to play", { p0: title(local) });
       }
     } catch { /* the next foreground poll retries */ }
   }
 
   function togglePlayer() {
-    if (!current && !currentPodcast) return;
+    if ((!current && !currentPodcast) || caching) return;
     if (audio.paused) audio.play().catch((nextError) => (error = String(nextError)));
     else audio.pause();
   }
 
-  function syncSystemMedia(force = false) {
+  function syncSystemMedia() {
+    mediaUpdates.request();
+  }
+
+  function publishSystemMedia() {
     const bridge = androidMediaBridge();
     const media = activeMedia === 'podcast' ? currentPodcast : current;
-    if (!bridge || !media) return;
-    const now = performance.now();
-    if (!force && now - lastSystemMediaSync < 900) return;
-    lastSystemMediaSync = now;
-    bridge.update(JSON.stringify({
+    if (!media || caching) return;
+    const metadata = {
       title: activeMedia === 'podcast' ? currentPodcast?.title : current ? title(current) : '',
       artist: activeMedia === 'podcast' ? currentPodcast?.feedTitle : current ? artist(current) : '',
+      labels: { previous: $t('Previous track'), rewind: $t('Back 15 seconds'), play: $t('Play'), pause: $t('Pause'), forward: $t('Forward 15 seconds'), next: $t('Next track'), channel: $t('Media playback') },
+      canSeek,
       playing,
-      position: Number.isFinite(currentTime) ? currentTime : 0,
-      duration: Number.isFinite(duration) ? duration : 0,
+      position: safePosition(currentTime, duration || undefined),
+      duration: validDuration(duration),
       canPrevious: activeMedia === 'music' && playerQueue.length > 1 && (playMode !== 'random' || randomHistoryIndex > 0),
       canNext: activeMedia === 'music' && playerQueue.length > 1
-    }));
+    };
+    if (bridge) {
+      const payload = JSON.stringify(metadata);
+      if (payload !== lastAndroidState) {
+        lastAndroidState = payload;
+        bridge.update(payload);
+      }
+    } else if ('mediaSession' in navigator) {
+      const session = navigator.mediaSession;
+      try {
+        // An estimate is for display only. Do not publish unknown or invalid
+        // timing through WebKit's native desktop media conversions.
+        if (!metadata.duration) {
+          if (lastSystemPosition) {
+            lastSystemPosition = '';
+            lastSystemMetadata = '';
+            lastSystemState = '';
+            session.setPositionState();
+            session.metadata = null;
+            session.playbackState = 'none';
+          }
+          return;
+        }
+        const position = { duration: metadata.duration, playbackRate: 1, position: metadata.position };
+        const positionKey = JSON.stringify(position);
+        if (positionKey !== lastSystemPosition) {
+          session.setPositionState(position);
+          lastSystemPosition = positionKey;
+        }
+        const key = JSON.stringify([activeMedia, playbackSource, metadata.title, metadata.artist]);
+        if (key !== lastSystemMetadata && 'MediaMetadata' in window) {
+          session.metadata = new MediaMetadata({ title: metadata.title, artist: metadata.artist });
+          lastSystemMetadata = key;
+        }
+        const state = playing ? 'playing' : 'paused';
+        if (state !== lastSystemState) {
+          session.playbackState = state;
+          lastSystemState = state;
+        }
+      } catch { /* Some webviews expose only part of Media Session. */ }
+    }
+  }
+
+  function setupMediaSession() {
+    if (androidMediaBridge() || !('mediaSession' in navigator)) return () => {};
+    const handlers: Array<[MediaSessionAction, MediaSessionActionHandler]> = [
+      ['play', () => { if (audio?.paused) togglePlayer(); }],
+      ['pause', () => audio?.pause()],
+      ['previoustrack', () => { void moveTrack(-1); }],
+      ['nexttrack', () => { void moveTrack(1); }],
+      ['seekto', (event) => { if (event.seekTime !== undefined) seek(event.seekTime); }],
+      ['seekbackward', (event) => skipSeconds(-(event.seekOffset ?? 15))],
+      ['seekforward', (event) => skipSeconds(event.seekOffset ?? 15)]
+    ];
+    const registered: MediaSessionAction[] = [];
+    for (const [action, handler] of handlers) {
+      try {
+        navigator.mediaSession.setActionHandler(action, handler);
+        registered.push(action);
+      } catch { /* Unsupported actions must not prevent playback. */ }
+    }
+    return () => {
+      for (const action of registered) navigator.mediaSession.setActionHandler(action, null);
+    };
+  }
+
+  function handleKeyboard(event: KeyboardEvent) {
+    if (event.defaultPrevented || event.isComposing || pairingDialog?.open) return;
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'f') {
+      const search = document.querySelector<HTMLInputElement>('.search-area input');
+      if (search) { event.preventDefault(); search.focus(); search.select(); }
+      return;
+    }
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.repeat) return;
+    if (event.target instanceof HTMLElement && event.target.closest('input, textarea, select, button, a, summary, [contenteditable="true"]')) return;
+    if (!current && !currentPodcast) return;
+    if (event.code === 'Space') { event.preventDefault(); togglePlayer(); }
+    else if (event.key === 'ArrowLeft') { event.preventDefault(); skipSeconds(-15); }
+    else if (event.key === 'ArrowRight') { event.preventDefault(); skipSeconds(15); }
   }
 
   function handleSystemMediaAction(event: Event) {
@@ -644,6 +843,10 @@
       void moveTrack(-1);
     } else if (action === 'next') {
       void moveTrack(1);
+    } else if (action === 'rewind') {
+      skipSeconds(-15);
+    } else if (action === 'forward') {
+      skipSeconds(15);
     } else if (action.startsWith('seek:')) {
       const milliseconds = Number(action.slice(5));
       if (Number.isFinite(milliseconds)) seek(milliseconds / 1000);
@@ -651,9 +854,15 @@
   }
 
   function seek(value: number) {
-    if (!audio || !Number.isFinite(audio.duration)) return;
-    audio.currentTime = value;
-    currentTime = value;
+    if (!audio || !canSeek || !playbackSource || audio.currentSrc !== playbackSource || !Number.isFinite(value)) return;
+    const target = safePosition(value, duration);
+    audio.currentTime = target;
+    currentTime = target;
+    syncSystemMedia();
+  }
+
+  function skipSeconds(offset: number) {
+    if (audio) seek(audio.currentTime + offset);
   }
 
   function setVolume(value: number) {
@@ -691,7 +900,7 @@
 
   function handleTrackEnded() {
     playing = false;
-    syncSystemMedia(true);
+    syncSystemMedia();
     if (activeMedia !== 'music') return;
     if (playMode === 'once') return;
     if (playMode === 'repeat') {
@@ -720,7 +929,7 @@
 
   function podcastDate(timestamp: number) {
     if (!timestamp) return '';
-    return new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric' })
+    return new Intl.DateTimeFormat($locale, { day: 'numeric', month: 'short', year: 'numeric' })
       .format(new Date(timestamp * 1000));
   }
 
@@ -735,7 +944,7 @@
         invoke<T>(command, args),
         new Promise<T>((_, reject) => {
           timeout = window.setTimeout(
-            () => reject(new Error('The podcast service did not respond. Check your connection and retry.')),
+            () => reject(new Error($t('The podcast service did not respond. Check your connection and retry.'))),
             20_000
           );
         })
@@ -759,17 +968,17 @@
         headers: { Accept: 'application/json' },
         signal: controller.signal
       });
-      if (!response.ok) throw new Error(`Podcast directory returned ${response.status}.`);
+      if (!response.ok) throw new Error($t("Podcast directory returned {p0}.", { p0: response.status }));
       const advertisedLength = Number(response.headers.get('content-length') || 0);
-      if (advertisedLength > maximumBytes) throw new Error('Podcast directory response is too large.');
+      if (advertisedLength > maximumBytes) throw new Error($t('Podcast directory response is too large.'));
       const payload = await response.text();
       if (new TextEncoder().encode(payload).byteLength > maximumBytes) {
-        throw new Error('Podcast directory response is too large.');
+        throw new Error($t('Podcast directory response is too large.'));
       }
       return payload;
     } catch (nextError) {
       if (controller.signal.aborted) {
-        throw new Error('The podcast directory did not respond. Check your connection and retry.');
+        throw new Error($t('The podcast directory did not respond. Check your connection and retry.'));
       }
       throw nextError;
     } finally {
@@ -779,7 +988,7 @@
 
   async function searchPodcastDirectory(searchTerm: string, limit: number): Promise<PodcastFeed[]> {
     const query = searchTerm.trim();
-    if (!query || query.length > 120) throw new Error('Search for between 1 and 120 characters.');
+    if (!query || query.length > 120) throw new Error($t('Search for between 1 and 120 characters.'));
     const boundedLimit = Math.min(50, Math.max(1, limit));
     const payload = await fetchPodcastDirectory('search', {
       term: query,
@@ -921,23 +1130,25 @@
   async function playPodcast(episode: PodcastEpisode) {
     if (caching) return;
     caching = true;
+    resetPlaybackTiming();
     error = '';
     try {
       audio?.pause();
       const source = await invoke<{ url: string; downloaded: boolean }>('podcast_playback_url', { episode });
       activeMedia = 'podcast';
       currentPodcast = episode;
-      currentTime = 0;
-      duration = episode.duration || 0;
-      audio.src = source.url;
+      currentPodcastFeed = [selectedPodcast, currentPodcastFeed, ...likedPodcasts, ...podcastFeeds]
+        .find((feed) => feed?.id === episode.feedId) ?? null;
+      setPlaybackSource(source.url, episode.duration);
       audio.volume = volume;
       await audio.play();
       rememberPodcast(episode);
     } catch (nextError) {
       playing = false;
-      error = `Could not play ${episode.title}: ${String(nextError)}`;
+      error = msg("Could not play {p0}: {p1}", { p0: episode.title, p1: String(nextError) });
     } finally {
       caching = false;
+      syncSystemMedia();
     }
   }
 
@@ -948,9 +1159,9 @@
     try {
       await invoke('podcast_download', { episode });
       await refreshPodcastDownloads();
-      notice = `${episode.title} is downloading for offline listening`;
+      notice = msg("{p0} is downloading for offline listening", { p0: episode.title });
     } catch (nextError) {
-      error = `Could not download ${episode.title}: ${String(nextError)}`;
+      error = msg("Could not download {p0}: {p1}", { p0: episode.title, p1: String(nextError) });
     }
   }
 
@@ -964,8 +1175,14 @@
     return podcastDownloads.some((download) => !download.ready && /downloading/i.test(download.status));
   }
 
+  onMount(() => initializeLocale(() => osLocale()));
+  $effect(() => { $locale; untrack(() => syncSystemMedia()); });
+  $effect(() => { duration; canSeek; untrack(() => syncSystemMedia()); });
+
   onMount(() => {
-    const savedPlayMode = window.localStorage.getItem('napstrfy-play-mode');
+    void invoke<string>('client_platform').then((value) => { platform = value; }).catch(() => {});
+    const clearMediaSession = setupMediaSession();
+    const savedPlayMode = readStoredPreference('napstrfy-play-mode');
     if (playModes.some((mode) => mode.value === savedPlayMode)) playMode = savedPlayMode as PlayMode;
     try {
       const saved = JSON.parse(window.localStorage.getItem(likedMusicKey) || '[]') as unknown;
@@ -1005,12 +1222,17 @@
     };
     document.addEventListener('visibilitychange', foreground);
     window.addEventListener('napstrfy-media-action', handleSystemMediaAction);
+    window.addEventListener('keydown', handleKeyboard);
     return () => {
       window.clearInterval(statusTimer);
       window.clearInterval(transferTimer);
       window.clearInterval(podcastTimer);
       document.removeEventListener('visibilitychange', foreground);
       window.removeEventListener('napstrfy-media-action', handleSystemMediaAction);
+      window.removeEventListener('keydown', handleKeyboard);
+      timing.stop();
+      mediaUpdates.cancel();
+      clearMediaSession();
       androidMediaBridge()?.clear();
     };
   });
@@ -1021,95 +1243,103 @@
 {#if !status.paired && activeTab !== 'podcasts'}
   <main class="pair-screen">
     <div class="pair-glow"></div>
-    <div class="pair-logo" aria-label="Napstrfy"><img src="/favicon.png" alt="" /><span>napstrfy</span></div>
-    <p class="eyebrow">NAPSTR COMPANION</p>
-    <h1>Your music.<br />Wherever you are.</h1>
-    <p class="pair-copy">Pair securely with Napstr on your computer. Discovery and Tor downloads stay there; your music reaches this phone over encrypted Iroh.</p>
+    <div class="pair-logo" aria-label="Napstrfy"><img src={appIcon} alt="" /><span>napstrfy</span></div>
+    <p class="eyebrow">{$t("NAPSTR COMPANION")}</p>
+    <h1>{$t("Your music.")}<br />{$t("Wherever you are.")}</h1>
+    <p class="pair-copy">{$t("Connect to the computer running Napstr. Browse its library and listen here, with your music sent over an encrypted connection.")}</p>
     {#if error}
       <div class="error-card">
-        <span>{error}</span>
-        {#if cameraPermissionDenied}<button onclick={showCameraSettings}>Open app settings</button>{/if}
+        <span>{$t(error)}</span>
+        {#if cameraPermissionDenied}<button onclick={showCameraSettings}>{$t("Open app settings")}</button>{/if}
       </div>
     {/if}
-    <button class="scan-button" onclick={scanCode} disabled={scanning || pairing || statusLoading}><span>▦</span>{scanning ? 'Opening camera…' : pairing ? 'Pairing…' : 'Scan Napstr QR'}</button>
-    <button class="browse-podcasts" onclick={showPodcasts}>Listen to podcasts without pairing</button>
-    <details class="manual-pair">
-      <summary>Enter a pairing code instead</summary>
-      <textarea bind:value={pairingCode} placeholder="napstrfy://pair/…"></textarea>
-      <button onclick={() => pair()} disabled={!pairingCode.trim() || pairing}>Connect</button>
+    {#if mobile}
+      <button class="scan-button" onclick={scanCode} disabled={scanning || pairing || statusLoading}><span>▦</span>{scanning ? $t("Opening camera…") : pairing ? $t("Pairing…") : $t("Scan Napstr QR")}</button>
+    {/if}
+    <details class="manual-pair" class:desktop-pair={!mobile} bind:open={manualPairOpen}>
+      <summary>{mobile ? $t("Enter a pairing code instead") : $t("Connect with a pairing code")}</summary>
+      <p>{$t("On the computer running Napstr, open")} <strong>{$t("Napstrfy → Pair without a camera")}</strong>{$t(". Copy the code and paste it here within five minutes.")}</p>
+      <form onsubmit={(event) => { event.preventDefault(); void pair(); }}>
+        <textarea bind:value={pairingCode} aria-label={$t("Napstr pairing code")} placeholder="napstrfy://pair/…" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+        <button type="submit" disabled={!pairingCode.trim() || pairing || statusLoading}>{pairing ? $t("Connecting…") : $t("Connect to Napstr")}</button>
+      </form>
     </details>
-    <small class="pair-security">One-use pairing · no Nostr keys leave your computer</small>
+    <button class="browse-podcasts" onclick={showPodcasts}>{$t("Listen to podcasts without pairing")}</button>
+    <LanguageSelect />
+    <small class="pair-security">{$t("One-use pairing · no Nostr keys leave your computer")}</small>
   </main>
 {:else}
-  <main class="app-shell">
-    <header class="mobile-header">
-      <div class="brand"><img src="/napstr-logo-small.png" alt="" /><b>napstrfy</b></div>
+  <main class="app-shell" class:desktop={!mobile && platform !== ''}>
+    <header class="app-header">
+      <div class="brand"><img src={appIcon} alt="" /><b>napstrfy</b></div>
       {#if status.paired}
-        <button class="desktop-status" class:offline={!status.connected} onclick={reconnect}><i></i><span>{statusPending ? 'Connecting…' : status.connected ? status.desktopName || 'Napstr connected' : 'Reconnect'}{status.streamOnly ? ' · Read only' : ''}</span></button>
+        <button class="desktop-status" class:offline={!status.connected} onclick={reconnect}><i></i><span>{statusPending ? $t("Connecting…") : status.connected ? status.desktopName || $t("Napstr connected") : $t("Reconnect")}{status.streamOnly ? $t(" · Read only") : ''}</span></button>
       {:else}
-        <button class="desktop-status offline" onclick={() => (activeTab = 'music')}><i></i><span>Pair Napstr for music</span></button>
+        <button class="desktop-status offline" onclick={() => (activeTab = 'music')}><i></i><span>{$t("Pair Napstr for music")}</span></button>
       {/if}
     </header>
 
-    {#if error}<button class="error-banner" onclick={() => (error = '')}>{error}<span>×</span></button>{/if}
-    {#if notice}<button class="notice-banner" onclick={() => (notice = '')}>{notice}<span>×</span></button>{/if}
+    <div class="app-content">
+    {#if error}<button class="error-banner" onclick={() => (error = '')}>{$t(error)}<span>×</span></button>{/if}
+    {#if notice}<button class="notice-banner" onclick={() => (notice = '')}>{$t(notice)}<span>×</span></button>{/if}
 
     {#if activeTab === 'music'}
       <section class="search-area">
         <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void searchTracks(); }}>
-          <span>⌕</span><input bind:value={query} placeholder={status.streamOnly ? "Search Napstr’s music" : "Search your music and Nostr"} aria-label="Search tracks" />
+          <span>⌕</span><input bind:value={query} placeholder={status.streamOnly ? $t("Search Napstr’s music") : $t("Search your music and Nostr")} aria-label={$t("Search tracks")} />
           {#if query}<button type="button" class="clear-search" onclick={() => searchTracks('')}>×</button>{/if}
         </form>
-        <div class="chips"><button class:active={showingLikedMusic} onclick={showLikedTracks}>♥ Liked</button>{#each musicChips as chip}<button class:active={!showingLikedMusic && query.toLocaleLowerCase() === chip.toLocaleLowerCase()} onclick={() => selectChip(chip)}>{chip}</button>{/each}</div>
+        <div class="chips"><button class:active={showingLikedMusic} onclick={showLikedTracks}>{$t("♥ Liked")}</button>{#each musicChips as chip}<button class:active={!showingLikedMusic && query.toLocaleLowerCase() === chip.toLocaleLowerCase()} onclick={() => selectChip(chip)}>{$t(chip)}</button>{/each}</div>
       </section>
 
       <section class="library-heading">
-        <div><p>{showingLikedMusic ? 'FAVOURITES' : query ? 'SEARCH RESULTS' : 'YOUR NAPSTR'}</p><h1>{showingLikedMusic ? 'Liked music' : query ? query : 'Your music'}</h1></div>
-        <span>{total} {total === 1 ? 'track' : 'tracks'}</span>
+        <div><p>{showingLikedMusic ? $t("FAVOURITES") : query ? $t("SEARCH RESULTS") : $t("YOUR NAPSTR")}</p><h1>{showingLikedMusic ? $t("Liked music") : query ? query : $t("Your music")}</h1></div>
+        <span>{$t("Tracks: {count}", { count: total })}</span>
       </section>
 
-      <section class="track-list" aria-busy={loading}>
-        {#if loading}<div class="loading-list"><i></i><span>Asking Napstr…</span></div>{/if}
-        {#if !loading && tracks.length === 0}<div class="empty-library"><img src="/napstr-logo-small.png" alt="" /><h2>{showingLikedMusic ? 'No liked tracks yet' : 'No tracks found'}</h2><p>{showingLikedMusic ? 'Tap the heart beside a song to keep it here.' : query ? 'Try different words or clear the search.' : 'Add music to your Napstr folder on the computer.'}</p></div>{/if}
-        {#each tracks as track, index (track.fileId)}
+      <section class="track-list" aria-busy={loading || searchingNetwork}>
+        {#if loading && tracks.length === 0}<div class="loading-list"><i></i><span>{$t("Asking Napstr…")}</span></div>{/if}
+        {#if !loading && !searchingNetwork && tracks.length === 0}<div class="empty-library"><img src={appIcon} alt="" /><h2>{showingLikedMusic ? $t("No liked tracks yet") : $t("No tracks found")}</h2><p>{showingLikedMusic ? $t("Tap the heart beside a song to keep it here.") : query ? $t("Try different words or clear the search.") : $t("Add music to your Napstr folder on the computer.")}</p></div>{/if}
+        {#each tracks as track (track.fileId)}
           <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class="track-row">
             <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
-              <TrackArtwork {track} lookup={index < 24} />
+              <TrackArtwork {track} />
               <span class="track-copy">
                 <strong>{title(track)}</strong>
                 <small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small>
-                <span class="track-meta">{readableSize(track.size)}{#if !track.local} · {track.sources.length} {track.sources.length === 1 ? 'seeder' : 'seeders'}{/if}</span>
+                <span class="track-meta">{readableSize(track.size)}{#if !track.local} · {track.sources.length} {track.sources.length === 1 ? $t("seeder") : $t("seeders")}{/if}</span>
               </span>
-              <span class="track-action">{pending.has(track.fileId) ? '···' : track.local ? '⋮' : status.streamOnly ? 'Unavailable' : '⇩'}</span>
+              <span class="track-action">{pending.has(track.fileId) ? '···' : track.local ? '⋮' : status.streamOnly ? $t("Unavailable") : '⇩'}</span>
             </button>
-            <button class:liked={isTrackLiked(track)} class="like-button" onclick={() => toggleTrackLike(track)} aria-label={`${isTrackLiked(track) ? 'Unlike' : 'Like'} ${title(track)}`}>{isTrackLiked(track) ? '♥' : '♡'}</button>
+            <button class:liked={isTrackLiked(track)} class="like-button" onclick={() => toggleTrackLike(track)} aria-label={$t(isTrackLiked(track) ? 'Unlike {p0}' : 'Like {p0}', { p0: title(track) })}>{isTrackLiked(track) ? '♥' : '♡'}</button>
           </div>
         {/each}
-        {#if !showingLikedMusic && tracks.length < total}<button class="load-more" onclick={() => loadLibrary(true)} disabled={loadingMore}>{loadingMore ? 'Loading…' : `Load more · ${tracks.length} of ${total}`}</button>{/if}
+        {#if searchingNetwork && (!loading || tracks.length > 0)}<div class="loading-list network-search-status" role="status"><i></i><span>{$t("Searching")}…</span></div>{/if}
+        {#if !showingLikedMusic && tracks.length < total}<button class="load-more" onclick={() => loadLibrary(true)} disabled={loadingMore}>{loadingMore ? $t("Loading…") : $t("Load more · {p0} of {p1}", { p0: tracks.length, p1: total })}</button>{/if}
       </section>
     {:else if activeTab === 'podcasts'}
       <section class="search-area podcast-search">
         <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void searchPodcasts(); }}>
-          <span>⌕</span><input bind:value={podcastQuery} placeholder="Search podcasts" aria-label="Search podcasts" />
+          <span>⌕</span><input bind:value={podcastQuery} placeholder={$t("Search podcasts")} aria-label={$t("Search podcasts")} />
           {#if podcastQuery}<button type="button" class="clear-search" onclick={() => { podcastQuery = ''; void loadTrendingPodcasts(); }}>×</button>{/if}
         </form>
-        <div class="chips podcast-genres"><button class:active={showingLikedPodcasts} onclick={showLikedPodcastList}>♥ Liked</button>{#each podcastGenres as genre}<button class:active={!showingLikedPodcasts && podcastGenre === genre} onclick={() => selectPodcastGenre(genre)}>{genre}</button>{/each}</div>
+        <div class="chips podcast-genres"><button class:active={showingLikedPodcasts} onclick={showLikedPodcastList}>{$t("♥ Liked")}</button>{#each podcastGenres as genre}<button class:active={!showingLikedPodcasts && podcastGenre === genre} onclick={() => selectPodcastGenre(genre)}>{$t(genre)}</button>{/each}</div>
       </section>
 
       {#if selectedPodcast}
         <section class="podcast-show-heading">
           <button class="podcast-back" onclick={() => { selectedPodcast = null; podcastEpisodes = []; }}>‹</button>
           {#if selectedPodcast.image}<img src={selectedPodcast.image} alt="" />{:else}<div class="podcast-art-fallback">◉</div>{/if}
-          <div><p>PODCAST</p><h1>{selectedPodcast.title}</h1><small>{selectedPodcast.author || 'Independent podcast'}</small></div>
-          <button class:liked={isPodcastLiked(selectedPodcast)} class="like-button podcast-heading-like" onclick={() => togglePodcastLike(selectedPodcast!)} aria-label={`${isPodcastLiked(selectedPodcast) ? 'Unlike' : 'Like'} ${selectedPodcast.title}`}>{isPodcastLiked(selectedPodcast) ? '♥' : '♡'}</button>
+          <div><p>{$t("PODCAST")}</p><h1>{selectedPodcast.title}</h1><small>{selectedPodcast.author || $t("Independent podcast")}</small></div>
+          <button class:liked={isPodcastLiked(selectedPodcast)} class="like-button podcast-heading-like" onclick={() => togglePodcastLike(selectedPodcast!)} aria-label={$t(isPodcastLiked(selectedPodcast) ? 'Unlike {p0}' : 'Like {p0}', { p0: selectedPodcast.title })}>{isPodcastLiked(selectedPodcast) ? '♥' : '♡'}</button>
         </section>
         <section class="episode-list" aria-busy={podcastLoading}>
-          {#if podcastLoading}<div class="loading-list"><i></i><span>Loading episodes…</span></div>{/if}
+          {#if podcastLoading}<div class="loading-list"><i></i><span>{$t("Loading episodes…")}</span></div>{/if}
           {#each podcastEpisodes as episode (episode.id)}
             {@const download = podcastDownloadFor(episode.id)}
             {@const episodeImage = episode.image || selectedPodcast.image}
             <article class="episode-row">
-              <button class="episode-art" onclick={() => playPodcast(episode)} aria-label={`Play ${episode.title}`}>
+              <button class="episode-art" onclick={() => playPodcast(episode)} aria-label={$t("Play {p0}", { p0: episode.title })}>
                 <span class="podcast-art-fallback">◉</span>
                 {#if episodeImage}<img src={episodeImage} alt="" onerror={(event) => usePodcastArtwork(event, selectedPodcast!.image)} />{/if}
                 <i aria-hidden="true">▶</i>
@@ -1119,37 +1349,37 @@
                 {#if episode.description}<span>{episode.description}</span>{/if}
                 <small>{podcastDate(episode.datePublished)}{episode.duration ? ` · ${clock(episode.duration)}` : ''}</small>
               </button>
-              <button class:ready={download?.ready} class="episode-download" onclick={() => downloadPodcast(episode)} disabled={download?.status === 'Downloading'} aria-label={`Download ${episode.title}`} title={download?.status || 'Download for offline listening'}>{download?.ready ? '✓' : download?.status === 'Downloading' ? `${Math.round(download.progress)}%` : '⇩'}</button>
+              <button class:ready={download?.ready} class="episode-download" onclick={() => downloadPodcast(episode)} disabled={download?.status === 'Downloading'} aria-label={$t("Download {p0}", { p0: episode.title })} title={download?.status || $t("Download for offline listening")}>{download?.ready ? '✓' : download?.status === 'Downloading' ? `${Math.round(download.progress)}%` : '⇩'}</button>
             </article>
           {/each}
-          {#if !podcastLoading && podcastEpisodes.length === 0}<div class="empty-library"><h2>No playable episodes</h2><p>This feed may not currently expose supported HTTPS audio.</p></div>{/if}
+          {#if !podcastLoading && podcastEpisodes.length === 0}<div class="empty-library"><h2>{$t("No playable episodes")}</h2><p>{$t("This feed may not currently expose supported HTTPS audio.")}</p></div>{/if}
         </section>
       {:else}
         {#if podcastHistory.length > 0 && !podcastQuery && !podcastGenre && !showingLikedPodcasts}
-          <section class="podcast-history"><div class="section-label"><b>Recently played</b><span>Last 10</span></div><div class="history-scroller">{#each podcastHistory as episode (episode.id)}<button onclick={() => playPodcast(episode)}>{#if episode.image}<img src={episode.image} alt="" />{:else}<span>◉</span>{/if}<strong>{episode.title}</strong><small>{episode.feedTitle}</small></button>{/each}</div></section>
+          <section class="podcast-history"><div class="section-label"><b>{$t("Recently played")}</b><span>{$t("Last 10")}</span></div><div class="history-scroller">{#each podcastHistory as episode (episode.id)}<button onclick={() => playPodcast(episode)}>{#if episode.image}<img src={episode.image} alt="" />{:else}<span>◉</span>{/if}<strong>{episode.title}</strong><small>{episode.feedTitle}</small></button>{/each}</div></section>
         {/if}
         <section class="library-heading">
-          <div><p>{showingLikedPodcasts ? 'FAVOURITES' : 'POWERED BY PODCAST INDEX'}</p><h1>{showingLikedPodcasts ? 'Liked podcasts' : podcastGenre ? podcastGenre : podcastQuery ? `Results for “${podcastQuery}”` : 'Discover podcasts'}</h1></div>
-          <span>{podcastFeeds.length} shows</span>
+          <div><p>{showingLikedPodcasts ? $t("FAVOURITES") : $t("POWERED BY PODCAST INDEX")}</p><h1>{showingLikedPodcasts ? $t("Liked podcasts") : podcastGenre ? podcastGenre : podcastQuery ? $t("Results for “{p0}”", { p0: podcastQuery }) : $t("Discover podcasts")}</h1></div>
+          <span>{podcastFeeds.length} {$t("shows")}</span>
         </section>
         <section class="podcast-grid" aria-busy={podcastLoading}>
-          {#if podcastLoading}<div class="loading-list"><i></i><span>Searching podcasts…</span></div>{/if}
+          {#if podcastLoading}<div class="loading-list"><i></i><span>{$t("Searching podcasts…")}</span></div>{/if}
           {#each podcastFeeds as feed (feed.id)}
             <article class="podcast-card">
               <button class="podcast-open" onclick={() => openPodcast(feed)}>
                 {#if feed.image}<img src={feed.image} alt="" />{:else}<div class="podcast-art-fallback">◉</div>{/if}
-                <span><strong>{feed.title}</strong><small>{feed.author || 'Independent podcast'}</small></span>
+                <span><strong>{feed.title}</strong><small>{feed.author || $t("Independent podcast")}</small></span>
               </button>
-              <button class:liked={isPodcastLiked(feed)} class="like-button podcast-like" onclick={() => togglePodcastLike(feed)} aria-label={`${isPodcastLiked(feed) ? 'Unlike' : 'Like'} ${feed.title}`}>{isPodcastLiked(feed) ? '♥' : '♡'}</button>
+              <button class:liked={isPodcastLiked(feed)} class="like-button podcast-like" onclick={() => togglePodcastLike(feed)} aria-label={$t(isPodcastLiked(feed) ? 'Unlike {p0}' : 'Like {p0}', { p0: feed.title })}>{isPodcastLiked(feed) ? '♥' : '♡'}</button>
             </article>
           {/each}
-          {#if !podcastLoading && podcastFeeds.length === 0}<div class="empty-library"><h2>{showingLikedPodcasts ? 'No liked podcasts yet' : 'Search podcasts'}</h2><p>{showingLikedPodcasts ? 'Tap the heart beside a podcast to keep it here.' : 'Napstrfy searches podcasts directly over this phone\'s internet connection.'}</p></div>{/if}
+          {#if !podcastLoading && podcastFeeds.length === 0}<div class="empty-library"><h2>{showingLikedPodcasts ? $t("No liked podcasts yet") : $t("Search podcasts")}</h2><p>{showingLikedPodcasts ? $t("Use the heart beside a podcast to keep it here.") : $t("Napstrfy searches podcasts directly over this device’s internet connection.")}</p></div>{/if}
         </section>
       {/if}
     {:else}
       <section class="search-area audiobook-search">
         <form onsubmit={(event) => { event.preventDefault(); event.currentTarget.querySelector('input')?.blur(); void loadAudiobooks(); }}>
-          <span>⌕</span><input bind:value={audiobookQuery} placeholder="Search audiobooks" aria-label="Search audiobooks" />
+          <span>⌕</span><input bind:value={audiobookQuery} placeholder={$t("Search audiobooks")} aria-label={$t("Search audiobooks")} />
           {#if audiobookQuery}<button type="button" class="clear-search" onclick={() => { audiobookQuery = ''; void loadAudiobooks(); }}>×</button>{/if}
         </form>
       </section>
@@ -1158,68 +1388,93 @@
         <section class="audiobook-show-heading">
           <button class="podcast-back" onclick={() => (selectedAudiobook = null)}>‹</button>
           <div class="audiobook-cover">▥</div>
-          <div><p>AUDIOBOOK</p><h1>{selectedAudiobook.title}</h1><small>{selectedAudiobook.author || 'Unknown author'}{selectedAudiobook.narrator ? ` · Read by ${selectedAudiobook.narrator}` : ''}</small></div>
+          <div><p>{$t("AUDIOBOOK")}</p><h1>{selectedAudiobook.title}</h1><small>{selectedAudiobook.author || $t("Unknown author")}{selectedAudiobook.narrator ? $t(" · Read by {p0}", { p0: selectedAudiobook.narrator }) : ''}</small></div>
         </section>
         <section class="audiobook-chapter-list" aria-busy={audiobookLoading}>
           {#each selectedAudiobook.chapters as chapter, index (chapter.fileId)}
             <button class="audiobook-chapter" disabled={status.streamOnly && !chapter.local} onclick={() => activateAudiobookChapter(selectedAudiobook!, chapter)}>
               <span>{chapter.local ? '▶' : status.streamOnly ? '—' : '⇩'}</span>
-              <span><strong>{chapter.title || chapter.filename}</strong><small>Chapter {index + 1} · {readableSize(chapter.size)}</small></span>
+              <span><strong>{chapter.title || chapter.filename}</strong><small>{$t("Chapter")} {index + 1} · {readableSize(chapter.size)}</small></span>
             </button>
           {/each}
         </section>
       {:else}
         <section class="library-heading">
-          <div><p>YOUR NAPSTR</p><h1>Audiobooks</h1></div>
-          <span>{audiobookTotal} {audiobookTotal === 1 ? 'book' : 'books'}</span>
+          <div><p>{$t("YOUR NAPSTR")}</p><h1>{$t("Audiobooks")}</h1></div>
+          <span>{$t("Audiobooks: {count}", { count: audiobookTotal })}</span>
         </section>
         <section class="audiobook-list" aria-busy={audiobookLoading}>
-          {#if audiobookLoading}<div class="loading-list"><i></i><span>Asking Napstr…</span></div>{/if}
+          {#if audiobookLoading}<div class="loading-list"><i></i><span>{$t("Asking Napstr…")}</span></div>{/if}
           {#each audiobooks as book (book.audiobookId)}
             <button class="audiobook-card" onclick={() => openAudiobook(book)}>
               <span class="audiobook-cover">▥</span>
-              <span><strong>{book.title}</strong><small>{book.author || 'Unknown author'}</small><i>{book.chapterCount} {book.chapterCount === 1 ? 'file' : 'chapters'} · {readableSize(book.totalSize)}</i></span>
+              <span><strong>{book.title}</strong><small>{book.author || $t("Unknown author")}</small><i>{book.chapterCount} {book.chapterCount === 1 ? $t("file") : $t("chapters")} · {readableSize(book.totalSize)}</i></span>
               <b>›</b>
             </button>
           {/each}
-          {#if !audiobookLoading && audiobooks.length === 0}<div class="empty-library"><h2>No audiobooks found</h2><p>Group a chapter folder in Napstr, or add the tag “audiobook” to a complete one-file book.</p></div>{/if}
+          {#if !audiobookLoading && audiobooks.length === 0}<div class="empty-library"><h2>{$t("No audiobooks found")}</h2><p>{$t("Group a chapter folder in Napstr, or add the tag “audiobook” to a complete one-file book.")}</p></div>{/if}
         </section>
       {/if}
     {/if}
 
-    <nav class="bottom-nav" aria-label="Napstrfy navigation">
-      <button class:active={activeTab === 'music'} onclick={() => (activeTab = 'music')}><span>♫</span>Music</button>
-      <button class:active={activeTab === 'podcasts'} onclick={showPodcasts}><span>◉</span>Podcasts</button>
-      <button class:active={activeTab === 'audiobooks'} onclick={showAudiobooks}><span>▥</span>Audiobooks</button>
-      <button onclick={() => status.paired ? forgetDesktop() : (activeTab = 'music')}><span>⚙</span>Pairing</button>
+    </div>
+
+    <nav class="app-nav" aria-label={$t("Napstrfy navigation")}>
+      <button class:active={activeTab === 'music'} aria-current={activeTab === 'music' ? 'page' : undefined} onclick={() => (activeTab = 'music')}><span aria-hidden="true">♫</span>{$t("Music")}</button>
+      <button class:active={activeTab === 'podcasts'} aria-current={activeTab === 'podcasts' ? 'page' : undefined} onclick={showPodcasts}><span aria-hidden="true">◉</span>{$t("Podcasts")}</button>
+      <button class:active={activeTab === 'audiobooks'} aria-current={activeTab === 'audiobooks' ? 'page' : undefined} onclick={showAudiobooks}><span aria-hidden="true">▥</span>{$t("Audiobooks")}</button>
+      <button onclick={showPairing}><span aria-hidden="true">⚙</span>{$t("Settings")}</button>
     </nav>
 
     <section class:empty={activeMedia === 'music' ? !current : !currentPodcast} class="now-playing">
+      <div class="player-backdrop" aria-hidden="true"><span style:background-image={playerArtwork ? `url(${JSON.stringify(playerArtwork)})` : undefined}></span></div>
+      <div class="player-content">
       {#if activeMedia === 'podcast' && currentPodcast}
         {#if currentPodcast.image}<img class="podcast-player-art" src={currentPodcast.image} alt="" />{:else}<div class="empty-art">◉</div>{/if}
-      {:else if current}<TrackArtwork track={current} large lookup />{:else}<div class="empty-art">♪</div>{/if}
-      <div class="now-copy"><strong>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.title : current ? title(current) : 'Choose something to play'}</strong><small>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.feedTitle : current ? artist(current) : 'Music and podcasts, wherever you are'}</small></div>
-      <div class="timeline"><input type="range" min="0" max={duration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} disabled={!current && !currentPodcast} /><span>{clock(currentTime)} / {clock(duration)}</span></div>
+      {:else if current}<TrackArtwork track={current} large lookup onartworkchange={(url) => { currentArtwork = url; }} />{:else}<div class="empty-art">♪</div>{/if}
+      <div class="now-copy"><strong>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.title : current ? title(current) : $t("Choose something to play")}</strong><small>{activeMedia === 'podcast' && currentPodcast ? currentPodcast.feedTitle : current ? artist(current) : $t("Music and podcasts, wherever you are")}</small></div>
+      <div class="timeline"><input aria-label={$t("Playback position")} type="range" min="0" max={displayedDuration || 0} step="0.1" value={currentTime} oninput={(event) => seek(Number(event.currentTarget.value))} disabled={!canSeek} /><span>{clock(currentTime)} / {displayedDuration ? `${duration ? '' : '≈ '}${clock(displayedDuration)}` : '—'}</span></div>
       <div class="player-buttons">
-        <button onclick={() => moveTrack(-1)} disabled={activeMedia !== 'music' || playerQueue.length < 2 || (playMode === 'random' && randomHistoryIndex <= 0)} aria-label="Previous track">|◀</button>
-        <button class="play-main" onclick={togglePlayer} disabled={(!current && !currentPodcast) || caching}>{caching ? '···' : playing ? 'Ⅱ' : '▶'}</button>
-        <button onclick={() => moveTrack(1)} disabled={activeMedia !== 'music' || playerQueue.length < 2} aria-label="Next track">▶|</button>
-        <button class="mode-button" class:active={activeMedia === 'music'} onclick={cyclePlayMode} disabled={activeMedia !== 'music'} aria-label={playModeDetails().label} title={playModeDetails().label}>{playModeDetails().icon}</button>
+        <button onclick={() => moveTrack(-1)} disabled={activeMedia !== 'music' || playerQueue.length < 2 || (playMode === 'random' && randomHistoryIndex <= 0)} aria-label={$t("Previous track")}>|◀</button>
+        <button class="seek-button" onclick={() => skipSeconds(-15)} disabled={!canSeek} aria-label={$t("Back 15 seconds")} title={$t("Back 15 seconds")}><SeekIcon /></button>
+        <button class="play-main" onclick={togglePlayer} aria-label={caching ? $t("Loading audio") : playing ? $t("Pause") : $t("Play")} title={$t("Play / pause (Space)")} disabled={(!current && !currentPodcast) || caching}>{caching ? '···' : playing ? 'Ⅱ' : '▶'}</button>
+        <button class="seek-button" onclick={() => skipSeconds(15)} disabled={!canSeek} aria-label={$t("Forward 15 seconds")} title={$t("Forward 15 seconds")}><SeekIcon forward /></button>
+        <button onclick={() => moveTrack(1)} disabled={activeMedia !== 'music' || playerQueue.length < 2} aria-label={$t("Next track")}>▶|</button>
+        <button class="like-button player-like" class:liked={playerLiked} disabled={!playerLikeTitle}
+          onclick={() => { if (activeMedia === 'music' && current) toggleTrackLike(current); else if (currentPodcastFeed) togglePodcastLike(currentPodcastFeed); }}
+          aria-pressed={playerLiked} aria-label={$t(playerLiked ? 'Unlike {p0}' : 'Like {p0}', { p0: playerLikeTitle || '' })}
+          title={$t(playerLiked ? 'Unlike {p0}' : 'Like {p0}', { p0: playerLikeTitle || '' })}>{playerLiked ? '♥' : '♡'}</button>
+        <button class="mode-button" class:active={activeMedia === 'music'} onclick={cyclePlayMode} disabled={activeMedia !== 'music'} aria-label={$t(playModeDetails().label)} title={$t(playModeDetails().label)}><span aria-hidden="true">{playModeDetails().icon}</span><span class="mode-label">{$t(playModeDetails().label)}</span></button>
       </div>
-      <label class="volume">⌁ <input type="range" min="0" max="1" step="0.02" value={volume} oninput={(event) => setVolume(Number(event.currentTarget.value))} /></label>
+      <label class="volume">{$t("Volume")} <input aria-label={$t("Volume")} type="range" min="0" max="1" step="0.02" value={volume} oninput={(event) => setVolume(Number(event.currentTarget.value))} /></label>
+      </div>
     </section>
   </main>
 {/if}
 
+<dialog bind:this={pairingDialog} class="pairing-dialog" aria-labelledby="pairing-heading">
+  <h2 id="pairing-heading">{$t("Settings")}</h2>
+  {#if status.paired}
+  <LanguageSelect />
+  <h3>{$t("Your Napstr connection")}</h3>
+  <p class="connected-name">{status.desktopName || 'Napstr'}</p>
+  <p>{status.connected ? $t("Connected") : $t("Offline")} · {status.streamOnly ? $t("Read-only access") : $t("Full access")}</p>
+  <p>{$t("Napstr must stay running to browse and fetch audio. Cached music can play offline.")}</p>
+  <p>{$t("Disconnecting will require a new pairing code to connect again.")}</p>
+  {/if}
+  <div class="dialog-actions">{#if status.paired}<button class="disconnect-button" onclick={forgetDesktop}>{$t("Disconnect")}</button>{/if}<button onclick={() => pairingDialog.close()}>{$t("Done")}</button></div>
+</dialog>
+
 <audio
   bind:this={audio}
-  onplay={() => { playing = true; syncSystemMedia(true); }}
-  onpause={() => { playing = false; syncSystemMedia(true); }}
-  ontimeupdate={() => { currentTime = audio.currentTime; syncSystemMedia(); }}
-  ondurationchange={() => { duration = Number.isFinite(audio.duration) ? audio.duration : 0; syncSystemMedia(true); }}
+  onplay={() => { playing = true; syncSystemMedia(); }}
+  onpause={() => { playing = false; syncSystemMedia(); }}
+  ontimeupdate={updatePlaybackPosition}
+  onloadedmetadata={() => timing.request()}
+  ondurationchange={() => timing.request()}
   onended={handleTrackEnded}
   onerror={() => {
-    if (activeMedia === 'podcast' && currentPodcast) error = `This phone could not play ${currentPodcast.title}.`;
-    else if (current) error = `This phone could not decode ${current.format} audio.`;
+    if (activeMedia === 'podcast' && currentPodcast) error = msg("This device could not play {p0}.", { p0: currentPodcast.title });
+    else if (current) error = msg("This device could not decode {p0} audio.", { p0: current.format });
   }}
 ></audio>

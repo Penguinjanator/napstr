@@ -254,7 +254,7 @@ body.resizing-transfer-pane, body.resizing-transfer-pane * { cursor: ns-resize !
   .search-form label[for="format"], .search-form select { display: none; }
   .split-content { grid-template-columns: minmax(0, 1.45fr) minmax(210px, .8fr); }
   .file-table .name-col { width: auto; }
-  .results-pane .file-table th:nth-child(5), .results-pane .file-table td:nth-child(5),
+  .results-pane .file-table th:nth-child(4), .results-pane .file-table td:nth-child(4),
   .results-pane .file-table th:nth-child(6), .results-pane .file-table td:nth-child(6),
   .download-table th:nth-child(4), .download-table td:nth-child(4) { display: none; }
   .sources-list > div, .source-row { grid-template-columns: 22px minmax(0, 1fr) 58px; }

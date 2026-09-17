@@ -7,7 +7,7 @@ import { languages, untranslatedStatuses } from '../shared/i18n/core.js';
 
 const root = new URL('../', import.meta.url);
 const dynamicKeys = [
-  'Downloads', 'Shared', 'Settings', 'Trollbox', 'Mobile', 'All audio', 'All audiobooks', 'local catalogue',
+  'Downloads', 'Shared', 'Settings', 'Trollbox', 'Napstrfy', 'All audio', 'All audiobooks', 'local catalogue',
   'Local', 'Tor connected', 'Tor failed', 'Tor connecting', 'Tor unavailable', 'Ready', 'Waiting',
   'Rock', 'Soundtrack', 'Punk', 'Folk', 'Upbeat', 'Comedy', 'News', 'True Crime', 'Society & Culture',
   'Technology', 'History', 'Business', 'Science', 'Arts', 'Sports', 'Education', 'Music',

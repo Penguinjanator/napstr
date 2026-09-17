@@ -1258,7 +1258,7 @@
     {/if}
     <details class="manual-pair" class:desktop-pair={!mobile} bind:open={manualPairOpen}>
       <summary>{mobile ? $t("Enter a pairing code instead") : $t("Connect with a pairing code")}</summary>
-      <p>{$t("On the computer running Napstr, open")} <strong>{$t("Mobile → Pair without a camera")}</strong>{$t(". Copy the code and paste it here within five minutes.")}</p>
+      <p>{$t("On the computer running Napstr, open")} <strong>{$t("Napstrfy → Pair without a camera")}</strong>{$t(". Copy the code and paste it here within five minutes.")}</p>
       <form onsubmit={(event) => { event.preventDefault(); void pair(); }}>
         <textarea bind:value={pairingCode} aria-label={$t("Napstr pairing code")} placeholder="napstrfy://pair/…" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
         <button type="submit" disabled={!pairingCode.trim() || pairing || statusLoading}>{pairing ? $t("Connecting…") : $t("Connect to Napstr")}</button>

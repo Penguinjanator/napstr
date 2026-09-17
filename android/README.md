@@ -2,7 +2,7 @@
 
 Napstr's companion player for Android, Windows, Linux, and macOS.
 
-For desktop pairing, paste the code from Napstr's **Mobile → Pair without a camera**.
+For desktop pairing, paste the code from Napstr's **Napstrfy → Pair without a camera**.
 
 ## Desktop
 
@@ -64,6 +64,10 @@ adb devices
 
 ## Run on a phone
 
+Napstrfy keeps the screen awake while the app is open in the foreground. The power
+button still locks the phone, and the normal screen timeout applies after leaving
+the app.
+
 For a phone connected over USB, use:
 
 ```sh
@@ -85,9 +89,9 @@ npm run android:build -- --debug --apk
 adb install -r src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
 ```
 
-Pair the phone from Napstr's **Mobile** page. Napstr must remain running to browse or fetch its audio; songs already cached on the phone can play offline.
+Pair the phone from Napstr's **Napstrfy** page. Napstr must remain running to browse or fetch its audio; songs already cached on the phone can play offline.
 
-The Mobile page offers two independent, one-use QR codes:
+The Napstrfy page offers two independent, one-use QR codes:
 
 - **Full access** keeps the usual library search, Tor download requests, and verified offline audio cache.
 - **Read only** lets a phone browse, play, and cache music and audiobooks already on this Napstr. Playback uses the same verified offline audio cache, seeking, and next-track prefetching as full access. Napstr rejects requests to download new songs on the host and access its transfer history. Update both apps to get this playback behaviour.

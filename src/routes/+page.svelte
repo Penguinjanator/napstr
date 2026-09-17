@@ -17,7 +17,7 @@
   const CHAT_PAGE_SIZE = 100;
   const VISIBLE_SEEDER_LIMIT = 100;
 
-  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Mobile';
+  type View = 'Search' | 'Downloads' | 'Shared' | 'Profile' | 'Settings' | 'Trollbox' | 'Napstrfy';
   type PlayerMode = 'single' | 'folder' | 'all';
   type PlayerOrigin = 'search' | 'downloads' | 'shared' | 'audiobook' | 'direct';
   type WindowResizeDirection = 'East' | 'North' | 'NorthEast' | 'NorthWest' | 'South' | 'SouthEast' | 'SouthWest' | 'West';
@@ -59,7 +59,7 @@
     { label: 'Profile', icon: '☺' },
     { label: 'Settings', icon: '⚙' },
     { label: 'Trollbox', icon: '▣' },
-    { label: 'Mobile', icon: '▯' }
+    { label: 'Napstrfy', icon: '▯' }
   ];
 
   type NativeFile = { fileId: string; filename: string; path: string; folder: string; size: number; format: string; status: string; title: string; artist: string; album: string; mime: string; license: string; description: string; tags: string };
@@ -982,7 +982,7 @@
   function activateView(view: View) {
     activeView = view;
     if (view === 'Trollbox') void refreshTrollbox();
-    if (view === 'Mobile') void openMobileConnect();
+    if (view === 'Napstrfy') void openMobileConnect();
   }
 
   async function openMobileConnect() {
@@ -2243,7 +2243,7 @@
     const mobileTimer = window.setInterval(() => {
       if (mobilePairing && mobilePairing.expiresAt <= Math.floor(Date.now() / 1000)) mobilePairing = null;
       if (mobileStreamPairing && mobileStreamPairing.expiresAt <= Math.floor(Date.now() / 1000)) mobileStreamPairing = null;
-      if (activeView === 'Mobile') void refreshMobileStatus();
+      if (activeView === 'Napstrfy') void refreshMobileStatus();
     }, 3000);
     return () => {
       destroyed = true;
@@ -2541,9 +2541,9 @@
             <button class="classic-button primary" type="button" disabled={!networkConnected || trollboxSending || !trollboxDraft.trim()} onclick={() => void sendTrollboxMessage()}>{trollboxSending ? $t("Sending…") : $t("Send")}</button>
           </div>
         </section>
-      {:else if activeView === 'Mobile'}
+      {:else if activeView === 'Napstrfy'}
         <section class="full-panel mobile-connect-view">
-          <div class="panel-title"><span></span><b>{$t("Mobile connect")}</b><span></span></div>
+          <div class="panel-title"><span></span><b>{$t("Napstrfy")}</b><span></span></div>
           <div class="mobile-connect-status">
             <span><i class:amber={!mobileStatusValue?.online} class:error={Boolean(mobileStatusValue?.error)} class="led"></i><b>{mobileStatusValue?.online ? $t("Iroh ready") : mobileStatusValue?.running ? $t("Iroh connecting…") : $t("Iroh unavailable")}</b></span>
             <small>{$t("Napstr stays in control of discovery and Tor downloads.")}</small>

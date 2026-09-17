@@ -404,6 +404,44 @@ test('website downloads select the right product and display translated release 
   await expect(page.locator('[data-release-platform="windows"]')).toHaveAttribute('href', /Napstrfy_0.2.2_x64.exe$/);
 });
 
+test('Napstrfy downloads follow newly published assets and keep unavailable clients disabled', async ({ page }) => {
+  let version = '0.2.1';
+  let clients = ['android.apk'];
+  await page.route('https://api.github.com/**', (route) => route.fulfill({ json: {
+    tag_name: `v${version}`,
+    html_url: `https://github.com/lnbits/napstr/releases/tag/v${version}`,
+    assets: [...clients.map((client) => `Napstrfy_${version}_${client}`), `Napstr_${version}_x64.exe`].map((name) => ({
+      name, size: 1234567, browser_download_url: `https://github.com/lnbits/napstr/releases/download/v${version}/${name}`
+    }))
+  } }));
+  await page.goto('http://127.0.0.1:15175/napstrfy.html');
+  await expect(page.locator('[data-release-version="windows"]')).toHaveText('Unavailable');
+  await expect(page.locator('[data-release-platform="windows"]')).toHaveAttribute('aria-disabled', 'true');
+  await expect(page.locator('[data-release-platform="windows"]')).not.toHaveAttribute('href');
+  await expect(page.locator('[data-release-platform="napstrfy-android"]')).toHaveAttribute('href', /Napstrfy_0.2.1_android.apk$/);
+  await expect(page.locator('#release-status')).toContainText('some installers are not available');
+  version = '0.2.2';
+  clients = ['android.apk', 'x64.exe', 'amd64.AppImage', 'aarch64.dmg', 'x64.dmg'];
+  await page.reload();
+  await expect(page.locator('#release-status')).toHaveText('Napstrfy 0.2.2 downloads are ready.');
+  for (const [platform, file] of Object.entries({ windows: 'x64.exe', linux: 'amd64.AppImage', 'macos-arm64': 'aarch64.dmg', 'macos-intel': 'x64.dmg', 'napstrfy-android': 'android.apk' })) {
+    await expect(page.locator(`[data-release-platform="${platform}"]`)).toHaveAttribute('href', `https://github.com/lnbits/napstr/releases/download/v0.2.2/Napstrfy_0.2.2_${file}`);
+    await expect(page.locator(`[data-release-version="${platform}"]`)).toHaveText('0.2.2');
+  }
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: test.info().outputPath('napstrfy-downloads.png'), fullPage: true });
+});
+
+test('Napstrfy downloads retain a release-page fallback when GitHub is unavailable', async ({ page }) => {
+  await page.route('https://api.github.com/**', (route) => route.fulfill({ status: 403, json: { message: 'API rate limit exceeded' } }));
+  await page.goto('http://127.0.0.1:15175/napstrfy.html');
+  await expect(page.locator('#release-status')).toHaveText('The automatic download list is temporarily unavailable.');
+  await expect(page.locator('#release-page')).toHaveAttribute('href', 'https://github.com/lnbits/napstr/releases/latest');
+  await expect(page.locator('[data-release-version="windows"]')).toHaveText('Unavailable');
+  await expect(page.locator('[data-release-platform][href]')).toHaveCount(0);
+});
+
 
 test('switching language during playback preserves audio and updates Android media labels', async ({ page }) => {
   const wav = silentAudio();

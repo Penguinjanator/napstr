@@ -74,7 +74,8 @@ export async function loadLatestRelease(t, locale) {
 
     try {
       const response = await fetch(`https://api.github.com/repos/${repository}/releases/latest`, {
-        headers: { Accept: 'application/vnd.github+json' }
+        headers: { Accept: 'application/vnd.github+json' },
+        cache: 'no-store'
       });
       if (!response.ok) throw new Error(`GitHub returned ${response.status}`);
 
@@ -86,11 +87,11 @@ export async function loadLatestRelease(t, locale) {
           link.href = release.html_url;
         });
       }
-      document.querySelectorAll('[data-release-version]').forEach((element) => {
-        element.textContent = version;
-      });
-
       const matched = matchAssets(Array.isArray(release.assets) ? release.assets : []);
+      document.querySelectorAll('[data-release-version]').forEach((element) => {
+        const platform = element.dataset.releaseVersion;
+        element.textContent = !platform || matched[platform] ? version : t('Unavailable');
+      });
       const napstrfyPage = document.body.dataset.releaseProduct === 'napstrfy';
       const expectedPlatforms = napstrfyPage
         ? ['windows', 'linux', 'macos-arm64', 'macos-intel', 'napstrfy-android']
@@ -103,9 +104,12 @@ export async function loadLatestRelease(t, locale) {
       if (available.length === expectedPlatforms.length) {
         status.textContent = t('{product} {version} downloads are ready.', { product: productName, version });
       } else {
-        status.textContent = t('{product} {version} is published, but one or more installers are still uploading.', { product: productName, version });
+        status.textContent = t('{product} {version} is published, but some installers are not available in this release.', { product: productName, version });
       }
     } catch (error) {
+      document.querySelectorAll('[data-release-version]').forEach((element) => {
+        element.textContent = t('Unavailable');
+      });
       status.textContent = t('The automatic download list is temporarily unavailable.');
       console.warn('Could not load the latest Napstr release:', error);
     }

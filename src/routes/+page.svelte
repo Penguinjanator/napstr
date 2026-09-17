@@ -104,6 +104,8 @@
   let clearingTransfers = false;
   let removingTransfers = new Set<number>();
   let downloadGeneration = 0;
+  let nextOptimisticTransferId = Date.now();
+  let downloadLibraryRefreshNeeded = false;
   const pendingDownloadRequests = new Map<Promise<unknown>, string>();
   const downloadAttempts = new Map<string, { cancelled: boolean }>();
   const cancellingFiles = new Set<string>();
@@ -114,9 +116,9 @@
   let blockConfirmation: BlockConfirmation | null = null;
   let blockInProgress = false;
   let startingDownloads = new Set<string>();
-  let clock = '';
+  // Format the clock in the template: a legacy $: declaration here changes
+  // dependency tracking for the entire component and freezes helper-based views.
   let clockNow = Date.now();
-  $: clock = new Intl.DateTimeFormat($locale, { hour: '2-digit', minute: '2-digit' }).format(clockNow);
   let desktopRuntime = false;
   let nativeReady = false;
   let activityMessage: string | Message = msg("Starting Napstr…");
@@ -359,7 +361,9 @@
   }
 
   function isActiveTransfer(transfer: Pick<Transfer, 'progress' | 'status'>) {
-    return transfer.progress < 100 && !/^(Failed|Cancelled|Refused|All seeders refused)/.test(transfer.status);
+    // Receiving all bytes is not completion: verification and indexing still
+    // need to finish before the download disappears from the native queue.
+    return transfer.status !== 'Verified · Complete' && !/^(Failed|Cancelled|Refused|All seeders refused)/.test(transfer.status);
   }
 
   function isCompleteTransfer(transfer: Transfer) {
@@ -381,6 +385,45 @@
       status: transfer.status,
       destination: transfer.destination
     }));
+  }
+
+  function mergePendingTransfers(items: NativeTransfer[]): Transfer[] {
+    const updated = mapTransfers(items);
+    const pending = transfers.filter((transfer) => startingDownloads.has(transfer.fileId)
+      && !updated.some((item) => item.fileId === transfer.fileId));
+    return showAvailableDownloadSlots([...pending, ...updated]);
+  }
+
+  function showAvailableDownloadSlots(items: Transfer[]): Transfer[] {
+    items = items.map((item) => item.status === 'Starting download'
+      ? { ...item, status: 'Queued', speed: 'Queued' } : item);
+    let available = Math.max(0, 2 - items.filter((item) => isActiveTransfer(item)
+      && item.status !== 'Queued' && item.status !== 'Waiting to restart after reconnect').length);
+    // Native rows and optimistic rows are newest first. Reserve free slots for
+    // the oldest queued tracks while the native dispatcher starts their requests.
+    return items.slice().reverse().map((item) => {
+      if (!paused && item.status === 'Queued' && available > 0) {
+        available -= 1;
+        return { ...item, status: 'Starting download', speed: 'Connecting…' };
+      }
+      return item;
+    }).reverse();
+  }
+
+  async function applyTransferUpdate(items: NativeTransfer[]) {
+    const generation = downloadGeneration;
+    const updated = mergePendingTransfers(items);
+    const completed = updated.filter((transfer) => isCompleteTransfer(transfer) && !isLocalFile(transfer.fileId));
+    const vanished = transfers.filter((transfer) => !startingDownloads.has(transfer.fileId)
+      && isActiveTransfer(transfer) && !updated.some((item) => item.fileId === transfer.fileId));
+    transfers = updated;
+    if (completed.length || vanished.length) downloadLibraryRefreshNeeded = true;
+    if (downloadLibraryRefreshNeeded) {
+      if (await refreshLocalLibrary()) downloadLibraryRefreshNeeded = false;
+      if (generation !== downloadGeneration) return;
+      const latest = completed[0] ?? vanished.find((transfer) => isLocalFile(transfer.fileId));
+      if (latest) activityMessage = msg("{p0} downloaded, verified, and ready to play", { p0: latest.name });
+    }
   }
 
   function isLocalFile(fileId: string) {
@@ -1054,14 +1097,16 @@
     let skipped = 0;
     let failed = 0;
     try {
-      for (const target of targets) {
-        if (generation !== downloadGeneration) break;
-        if (!canDownloadResult(target)) { skipped += 1; continue; }
+      // Submit the entire selection immediately. The native queue owns the
+      // two-track limit; a slow request or UI refresh must not block enqueueing.
+      await Promise.all(targets.map(async (target) => {
+        if (generation !== downloadGeneration) return;
+        if (!canDownloadResult(target)) { skipped += 1; return; }
         try {
           if (await startDownload(target)) requested += 1;
           else failed += 1;
         } catch { failed += 1; }
-      }
+      }));
       if (generation === downloadGeneration) activityMessage = msg("Downloads requested: {requested} · Skipped: {skipped} · Failed: {failed}", { requested, skipped, failed });
     } finally {
       downloadingSelection = false;
@@ -1157,7 +1202,8 @@
         playerQueueIndex = playerQueue.findIndex((item) => item.fileId === currentTrack?.fileId);
       }
       syncResultLocality();
-    } catch { /* the next folder-watch or transfer poll will retry */ }
+      return true;
+    } catch { return false; /* the next folder-watch or transfer poll will retry */ }
   }
 
   function mergeIndexBatch(batch: IndexBatch) {
@@ -1455,18 +1501,23 @@
     resultUser = null;
     matchingUsers = [];
     searchedQuery = 'Surprise me';
+    query = '';
+    format = 'Audio only';
+    minimumSources = 1;
+    maximumSize = '';
     activityMessage = msg("Finding 50 random downloadable tracks…");
     try {
-      const page = await invoke<CatalogueBrowsePage>('network_browse', { cursor: null, limit: 50, cacheLimit: 50 });
-      if (generation !== browseGeneration) return;
-      let matches = page.results;
-      if (matches.length < 50 && page.cursor) {
-        const missing = await invoke<CatalogueBrowsePage>('network_browse', { cursor: page.cursor, limit: 50, cacheLimit: 50 });
+      let cursor: CatalogueBrowseCursor | null = null;
+      let downloadable: NetworkResult[] = [];
+      do {
+        const page: CatalogueBrowsePage = await invoke('network_browse', {
+          cursor, limit: 100, cacheLimit: 50000, unownedOnly: true
+        });
         if (generation !== browseGeneration) return;
-        matches = mergeNetworkPages(matches, missing.results);
-      }
-      const downloadable = eligibleNetworkMatches(matches)
-        .filter((item) => !isLocalFile(item.fileId) && item.sources.length > 0);
+        downloadable = eligibleNetworkMatches(mergeNetworkPages(downloadable, page.results))
+          .filter((item) => !isLocalFile(item.fileId) && item.sources.length > 0);
+        cursor = page.cursor;
+      } while (downloadable.length < 50 && cursor);
       results = mapNetworkFiles(shuffled(downloadable).slice(0, 50));
       resultsAreNetwork = true;
       resultPage = 0;
@@ -1511,10 +1562,10 @@
       startingDownloads = new Set(startingDownloads).add(target.fileId);
       const attempt = { cancelled: false };
       downloadAttempts.set(target.fileId, attempt);
-      transfers = [{
-        id: Date.now(), fileId: target.fileId, name: target.name, size: target.size,
-        speed: 'Contacting seeders…', progress: 0, status: 'Sending encrypted NIP-17 request', destination: ''
-      }, ...transfers];
+      transfers = showAvailableDownloadSlots([{
+        id: ++nextOptimisticTransferId, fileId: target.fileId, name: target.name, size: target.size,
+        speed: 'Queued', progress: 0, status: 'Queued', destination: ''
+      }, ...transfers]);
       const candidateCount = Math.min(sources.length, 3);
       activityMessage = msg("Finding the fastest Tor connection. Seeders: {p0}…", { p0: candidateCount });
       try {
@@ -1522,7 +1573,7 @@
         if (generation !== downloadGeneration || attempt.cancelled) return false;
         const updated = await invoke<NativeTransfer[]>('get_transfers');
         if (generation !== downloadGeneration || attempt.cancelled) return false;
-        transfers = mapTransfers(updated);
+        await applyTransferUpdate(updated);
         activityMessage = msg("Seeder race started · the fastest responsive source will stream the file");
         return true;
       } catch (error) {
@@ -1530,7 +1581,7 @@
         try {
           const updated = await invoke<NativeTransfer[]>('get_transfers');
           if (generation !== downloadGeneration || attempt.cancelled) return false;
-          transfers = mapTransfers(updated);
+          await applyTransferUpdate(updated);
         } catch {
           if (generation !== downloadGeneration || attempt.cancelled) return false;
           transfers = transfers.filter((item) => item.fileId !== target.fileId);
@@ -1678,7 +1729,7 @@
         destinationFolder: queue.destinationFolder
       });
       if (!audiobookDownloads.includes(queue)) return;
-      transfers = mapTransfers(await invoke<NativeTransfer[]>('get_transfers'));
+      await applyTransferUpdate(await invoke<NativeTransfer[]>('get_transfers'));
       activityMessage = msg("Downloading {p0} · chapter {p1} of {p2}", { p0: queue.title, p1: queue.nextIndex + 1, p2: queue.chapters.length });
     } catch (error) {
       if (!audiobookDownloads.includes(queue)) return;
@@ -2050,7 +2101,11 @@
     });
     void listen('napstr-transfers-changed', () => {
       void invoke<NativeTransfer[]>('get_transfers')
-        .then((items) => { transfers = mapTransfers(items); })
+        .then(async (items) => {
+          if (clearingTransfers || removingTransfers.size) return;
+          await applyTransferUpdate(items);
+          if (audiobookDownloads.length) await advanceAudiobookDownloads();
+        })
         .catch(() => {});
     }).then((unlisten) => {
       if (destroyed) unlisten();
@@ -2116,6 +2171,7 @@
     let transferPollPending = false;
     const transferTimer = window.setInterval(async () => {
       const transferWorkPending =
+        downloadLibraryRefreshNeeded ||
         startingDownloads.size > 0 ||
         audiobookDownloads.length > 0 ||
         transfers.some(isActiveTransfer);
@@ -2124,17 +2180,7 @@
       try {
         const items = await invoke<NativeTransfer[]>('get_transfers');
         if (clearingTransfers || removingTransfers.size) return;
-        const previouslyComplete = new Set(transfers.filter(isCompleteTransfer).map((transfer) => transfer.fileId));
-        const updated = mapTransfers(items);
-        const newlyComplete = updated.filter((transfer) => isCompleteTransfer(transfer) && !previouslyComplete.has(transfer.fileId));
-        const vanishedActive = transfers.filter((transfer) => !startingDownloads.has(transfer.fileId) && isActiveTransfer(transfer) && !updated.some((item) => item.id === transfer.id));
-        const optimistic = transfers.filter((transfer) => startingDownloads.has(transfer.fileId) && !updated.some((item) => item.fileId === transfer.fileId));
-        transfers = [...optimistic, ...updated];
-        if (newlyComplete.length || vanishedActive.length) {
-          await refreshLocalLibrary();
-          const latest = newlyComplete[0] ?? vanishedActive.find((transfer) => isLocalFile(transfer.fileId));
-          if (latest) activityMessage = msg("{p0} downloaded, verified, and ready to play", { p0: latest.name });
-        }
+        await applyTransferUpdate(items);
         if (audiobookDownloads.length) await advanceAudiobookDownloads();
       } catch { /* the next transfer poll retries */ }
       finally { transferPollPending = false; }
@@ -2538,7 +2584,7 @@
       </div>
     </section>
 
-    <footer class="statusbar"><span>{$t(activityMessage)}</span><span><i class:amber={!networkConnected} class="led"></i> Nostr {networkConnected ? $t("online") : $t("offline")}</span><span title={torError}>{$t("♜ Tor:")} {torRunning ? $t("ready") : torError ? $t("failed") : torStarting && torProgress > 0 ? `${torProgress}%` : $t("starting")}</span><span class="status-clock">{clock}</span></footer>
+    <footer class="statusbar"><span>{$t(activityMessage)}</span><span><i class:amber={!networkConnected} class="led"></i> Nostr {networkConnected ? $t("online") : $t("offline")}</span><span title={torError}>{$t("♜ Tor:")} {torRunning ? $t("ready") : torError ? $t("failed") : torStarting && torProgress > 0 ? `${torProgress}%` : $t("starting")}</span><span class="status-clock">{new Intl.DateTimeFormat($locale, { hour: '2-digit', minute: '2-digit' }).format(clockNow)}</span></footer>
   </section>
 
   {#if aboutOpen}

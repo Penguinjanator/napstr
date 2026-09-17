@@ -1934,11 +1934,17 @@ async fn network_browse(
     cursor: Option<network::CatalogueBrowseCursor>,
     limit: Option<usize>,
     cache_limit: Option<usize>,
+    unowned_only: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<network::CatalogueBrowsePage, String> {
     state
         .network
-        .browse(cursor, limit.unwrap_or(500), cache_limit.unwrap_or(10_000))
+        .browse(
+            cursor,
+            limit.unwrap_or(500),
+            cache_limit.unwrap_or(10_000),
+            unowned_only.unwrap_or(false),
+        )
         .await
 }
 

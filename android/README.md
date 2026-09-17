@@ -16,7 +16,7 @@ npm run bundle:macos     # DMG (on macOS)
 npm run appimage:build   # AppImage (Linux with Docker)
 ```
 
-Pushing a `v*` tag attaches all installers and checksums to a draft release.
+Pushing a `v*` tag attaches all installers to a draft release. GitHub displays a SHA-256 checksum for each installer.
 
 ## Android requirements
 

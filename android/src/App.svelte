@@ -1271,10 +1271,10 @@
       <section class="track-list" aria-busy={loading}>
         {#if loading}<div class="loading-list"><i></i><span>{$t("Asking Napstr…")}</span></div>{/if}
         {#if !loading && tracks.length === 0}<div class="empty-library"><img src={appIcon} alt="" /><h2>{showingLikedMusic ? $t("No liked tracks yet") : $t("No tracks found")}</h2><p>{showingLikedMusic ? $t("Tap the heart beside a song to keep it here.") : query ? $t("Try different words or clear the search.") : $t("Add music to your Napstr folder on the computer.")}</p></div>{/if}
-        {#each tracks as track, index (track.fileId)}
+        {#each tracks as track (track.fileId)}
           <div class:selected={selected?.fileId === track.fileId} class:remote={!track.local} class="track-row">
             <button class="track-open" disabled={status.streamOnly && !track.local} onclick={() => activateTrack(track)}>
-              <TrackArtwork {track} lookup={index < 24} />
+              <TrackArtwork {track} />
               <span class="track-copy">
                 <strong>{title(track)}</strong>
                 <small>{artist(track)}{track.album ? ` · ${track.album}` : ''}</small>

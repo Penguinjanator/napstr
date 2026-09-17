@@ -1,4 +1,5 @@
 use crate::transfer::{DownloadOffer, TransferService};
+use ::rand::seq::SliceRandom;
 use chrono::Utc;
 use futures_util::{stream, StreamExt};
 use keyring::Entry;
@@ -17,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::Emitter;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
 
 pub const CATALOGUE_KIND: u16 = 30421;
@@ -604,6 +605,7 @@ pub struct NetworkService {
     trollbox_cache_lock: Mutex<()>,
     track_discussion_subscription_lock: Mutex<()>,
     download_restart_lock: Mutex<()>,
+    download_queue_changed: Notify,
     connected: AtomicBool,
     generation: AtomicU64,
     last_error: RwLock<String>,
@@ -635,6 +637,7 @@ impl NetworkService {
             trollbox_cache_lock: Mutex::new(()),
             track_discussion_subscription_lock: Mutex::new(()),
             download_restart_lock: Mutex::new(()),
+            download_queue_changed: Notify::new(),
             connected: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             last_error: RwLock::new(String::new()),
@@ -899,7 +902,10 @@ impl NetworkService {
                         Duration::from_secs(10)
                     }
                 };
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {},
+                    _ = recovery.download_queue_changed.notified() => {},
+                }
             }
         });
         self.queue_catalogue_publish(true);
@@ -1643,7 +1649,7 @@ impl NetworkService {
             EMPTY_SEARCH_PAGE_LIMIT,
             EMPTY_SEARCH_RESULT_LIMIT,
         ));
-        self.search_inner(query, browse, None)
+        self.search_inner(query, browse, None, false)
             .await
             .map(|(results, _, _)| results)
     }
@@ -1653,9 +1659,10 @@ impl NetworkService {
         cursor: Option<CatalogueBrowseCursor>,
         limit: usize,
         cache_limit: usize,
+        unowned_only: bool,
     ) -> Result<CatalogueBrowsePage, String> {
         let (results, cursor, total_available) = self
-            .search_inner("", Some((cursor, limit, cache_limit)), None)
+            .search_inner("", Some((cursor, limit, cache_limit)), None, unowned_only)
             .await?;
         Ok(CatalogueBrowsePage {
             results,
@@ -1675,6 +1682,7 @@ impl NetworkService {
                 "",
                 Some((cursor, EMPTY_SEARCH_PAGE_LIMIT, AVAILABILITY_FILE_LIMIT)),
                 Some(author),
+                false,
             )
             .await?;
         Ok(CatalogueBrowsePage {
@@ -1936,6 +1944,7 @@ impl NetworkService {
         query: &str,
         browse: Option<(Option<CatalogueBrowseCursor>, usize, usize)>,
         author: Option<PublicKey>,
+        unowned_only: bool,
     ) -> Result<(Vec<CatalogueResult>, Option<CatalogueBrowseCursor>, usize), String> {
         let client = self
             .client
@@ -1966,7 +1975,7 @@ impl NetworkService {
                 browse.unwrap_or((None, EMPTY_SEARCH_PAGE_LIMIT, EMPTY_SEARCH_RESULT_LIMIT));
             initial_browse_cache_limit = cache_limit.clamp(
                 1,
-                if author.is_some() {
+                if author.is_some() || unowned_only {
                     AVAILABILITY_FILE_LIMIT
                 } else {
                     EMPTY_SEARCH_RESULT_LIMIT
@@ -2004,7 +2013,11 @@ impl NetworkService {
                         for event in events {
                             events_by_id.insert(event.id, event);
                         }
-                        session.pending_file_ids.extend(retry_file_ids);
+                        // Surprise browsing visits each candidate once so missing
+                        // relay metadata cannot keep the button spinning forever.
+                        if !unowned_only {
+                            session.pending_file_ids.extend(retry_file_ids);
+                        }
                     }
                     Err(error) => {
                         for file_id in requested_file_id_order.iter().rev() {
@@ -2107,6 +2120,9 @@ impl NetworkService {
 
         let mut aggregated: HashMap<String, CatalogueResult> = HashMap::new();
         let connection = super::open_connection(&self.db_path)?;
+        if unowned_only {
+            exclude_local_availability(&connection, &mut available_by_file, &mut online)?;
+        }
         let blocked_files = {
             let mut statement = connection
                 .prepare("SELECT file_id FROM blocked_files")
@@ -2160,6 +2176,9 @@ impl NetworkService {
                     .cmp(left_sources)
                     .then_with(|| left_id.cmp(right_id))
             });
+            if unowned_only {
+                ranked_ids.shuffle(&mut ::rand::rng());
+            }
             requested_file_id_order = ranked_ids
                 .into_iter()
                 .take(initial_browse_cache_limit)
@@ -2590,6 +2609,7 @@ impl NetworkService {
             transaction.execute("INSERT INTO download_sources(request_id,source_pubkey,status,updated_at) VALUES(?1,?2,'Queued',?3)", params![request_id, source, Utc::now().to_rfc3339()]).map_err(|error| error.to_string())?;
         }
         transaction.commit().map_err(|error| error.to_string())?;
+        self.download_queue_changed.notify_one();
         let _ = self.app_handle.emit(TRANSFERS_CHANGED_EVENT, ());
         Ok(request_id)
     }
@@ -2886,6 +2906,25 @@ impl NetworkService {
         }
         Ok(())
     }
+}
+
+fn exclude_local_availability(
+    connection: &Connection,
+    available: &mut HashMap<String, HashSet<String>>,
+    online: &mut HashSet<(String, String)>,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare("SELECT file_id FROM files")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let local = rows
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    available.retain(|file_id, _| !local.contains(file_id));
+    online.retain(|(_, file_id)| !local.contains(file_id));
+    Ok(())
 }
 
 fn trollbox_filter(limit: usize) -> Filter {
@@ -3786,6 +3825,43 @@ fn mime_for_format(format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surprise_candidates_exclude_owned_hashes_before_the_page_limit() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute("CREATE TABLE files(file_id TEXT PRIMARY KEY)", [])
+            .unwrap();
+        let mut available = HashMap::new();
+        let mut online = HashSet::new();
+        for index in 0..130 {
+            let id = format!("{index:064x}");
+            let sources = HashSet::from(["self".to_owned(), "peer".to_owned()]);
+            for source in &sources {
+                online.insert((source.clone(), id.clone()));
+            }
+            available.insert(id.clone(), sources);
+            if index < 80 {
+                connection
+                    .execute("INSERT INTO files VALUES(?1)", [id])
+                    .unwrap();
+            }
+        }
+        exclude_local_availability(&connection, &mut available, &mut online).unwrap();
+        assert_eq!(available.len(), 50);
+        assert_eq!(online.len(), 100);
+        assert!(available
+            .keys()
+            .all(|id| u32::from_str_radix(id, 16).unwrap() >= 80));
+        // A download finishing while Surprise me paginates is excluded too.
+        let completed = format!("{:064x}", 80);
+        connection
+            .execute("INSERT INTO files VALUES(?1)", [&completed])
+            .unwrap();
+        exclude_local_availability(&connection, &mut available, &mut online).unwrap();
+        assert!(!available.contains_key(&completed));
+        assert!(online.iter().all(|(_, id)| id != &completed));
+    }
 
     fn insert_interrupted_download(
         connection: &Connection,

@@ -85,6 +85,123 @@ async function serveAudio(route) {
   } else await route.fulfill({ contentType: 'audio/wav', headers, body: wav });
 }
 
+for (const code of ['en', 'zh', 'ar']) {
+  test(`Napstr ${code}: search, pagination and Tor-to-Local update without leaving the screen`, async ({ page }) => {
+    await mockNative(page, { app: 'napstr', saved: code });
+    await page.addInitScript(() => {
+      const invoke = window.__TAURI_INTERNALS__.invoke;
+      const track = (index, prefix) => ({ fileId: index.toString(16).padStart(64, '0'), filename: `${prefix} ${index}.mp3`,
+        title: `${prefix} ${String(index).padStart(3, '0')}`, artist: '', album: '', format: 'MP3', mime: 'audio/mpeg', size: 1000000,
+        folder: '', path: `/music/${index}.mp3`, sources: [{ pubkey: 'd'.repeat(64), npub: 'npub1source', displayName: 'Source' }] });
+      const callbacks = new Map();
+      const handlers = new Map();
+      window.__TAURI_INTERNALS__.transformCallback = (callback) => { const id = callbacks.size + 1; callbacks.set(id, callback); return id; };
+      window.emitNative = (event) => callbacks.get(handlers.get(event))?.({ event, id: 1, payload: null });
+      window.localFiles = [];
+      window.downloads = [];
+      window.finishDownload = () => {
+        window.localFiles = [track(200, 'New')];
+        window.downloads = [];
+        window.emitNative('napstr-transfers-changed');
+      };
+      window.addLocalFiles = () => {
+        window.localFiles = Array.from({ length: 105 }, (_, index) => track(index, 'Library'));
+        window.emitNative('napstr-library-changed');
+      };
+      window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
+        if (cmd === 'plugin:event|listen') { handlers.set(args.event, args.handler); return 1; }
+        if (cmd === 'get_snapshot') return { ...(await invoke(cmd, args)), files: window.localFiles, transfers: window.downloads };
+        if (cmd === 'network_browse') return { results: [], cursor: null, totalAvailable: 0 };
+        if (cmd === 'network_search') return args.query === 'first'
+          ? Array.from({ length: 115 }, (_, index) => track(index, 'First'))
+          : [track(200, 'New'), track(201, 'New')];
+        if (cmd === 'resolve_catalogue_user' || cmd === 'search_catalog') return [];
+        if (cmd === 'get_transfers') return window.downloads;
+        if (cmd === 'request_network_download') {
+          window.downloads = [{ ...track(200, 'New'), id: -1, progress: 100, status: 'Downloading', speed: '1 MB/s', destination: '' }];
+          return 'request';
+        }
+        return invoke(cmd, args);
+      };
+    });
+    await page.goto('http://127.0.0.1:15173');
+    await expect(page.locator('.search-button')).toBeEnabled();
+    const rows = page.locator('.search-results-table tbody tr');
+    await page.locator('#search-query').fill('first');
+    await page.locator('.search-button').click();
+    await expect(rows).toHaveCount(100);
+    await page.locator('.results-pane .results-pager button').last().click();
+    await expect(rows).toHaveCount(15);
+    await expect(rows.first()).toContainText('First 100');
+    await page.locator('#search-query').fill('second');
+    await page.locator('.search-button').click();
+    await expect(rows).toHaveCount(2);
+    await expect(rows.first()).toContainText('New 200');
+    await expect(rows.first().locator('td').nth(4)).toHaveText('Tor');
+    await page.locator('.detail-actions button.primary').click();
+    await expect(page.locator('.mini-row')).toHaveCount(1);
+    await page.evaluate(() => window.finishDownload());
+    await expect(rows.first().locator('td').nth(4)).toHaveText(catalogs[code].Local);
+    await expect(page.locator('.detail-actions button.primary')).toHaveText(catalogs[code]['▶ Play']);
+    // The shared library uses the same helper pattern: an event must update it
+    // in place, and its pager must actually replace the displayed rows.
+    await page.locator('.tool-button').filter({ hasText: catalogs[code].Shared }).click();
+    await expect(page.locator('.shared-table tbody tr')).toHaveCount(1);
+    await page.evaluate(() => window.addLocalFiles());
+    await expect(page.locator('.shared-table tbody tr')).toHaveCount(100);
+    await page.locator('.full-panel .results-pager button').last().click();
+    await expect(page.locator('.shared-table tbody tr')).toHaveCount(5);
+  });
+
+  test(`Napstr ${code}: Surprise me fills 50 unowned tracks across pages and ignores old filters`, async ({ page }) => {
+    await mockNative(page, { app: 'napstr', saved: code });
+    await page.addInitScript(() => {
+      const invoke = window.__TAURI_INTERNALS__.invoke;
+      const track = (index) => ({ fileId: index.toString(16).padStart(64, '0'), filename: `Track ${index}.mp3`,
+        title: `Track ${index}`, artist: 'Search', album: '', format: 'MP3', mime: 'audio/mpeg', size: 1000000,
+        sources: [{ pubkey: 'd'.repeat(64), npub: 'npub1source', displayName: 'Source' }] });
+      const owned = Array.from({ length: 80 }, (_, index) => track(index));
+      window.surpriseCalls = [];
+      window.__TAURI_INTERNALS__.invoke = async (cmd, args = {}) => {
+        if (cmd === 'get_snapshot') return { ...(await invoke(cmd, args)), files: owned, transfers: [] };
+        if (cmd === 'network_browse' && args.unownedOnly) {
+          window.surpriseCalls.push(args);
+          const number = Number(args.cursor?.sessionId || 0);
+          // Include owned entries and duplicates defensively, and leave an
+          // empty middle page to exercise continuation past unavailable metadata.
+          const pages = [owned, [], Array.from({ length: 20 }, (_, i) => track(80 + i)),
+            Array.from({ length: 40 }, (_, i) => track(90 + i))];
+          return { results: pages[number], cursor: number < 3 ? { sessionId: String(number + 1) } : null, totalAvailable: 130 };
+        }
+        return invoke(cmd, args);
+      };
+    });
+    await page.goto('http://127.0.0.1:15173');
+    await expect(page.locator('.surprise-button')).toBeEnabled();
+    await page.locator('#format').selectOption('Audiobooks');
+    await expect(page.locator('.surprise-button')).toBeEnabled();
+    await page.locator('#search-query').fill('An unrelated old search');
+    await page.locator('.advanced-toggle').click();
+    await page.locator('.advanced-row input[type="number"]').fill('99');
+    await page.locator('.advanced-row input:not([type])').fill('1 B');
+    await page.locator('.surprise-button').click();
+    const rows = page.locator('.results-pane tbody tr');
+    await expect(rows).toHaveCount(50);
+    await expect(page.locator('.surprise-button')).toBeEnabled();
+    expect(await page.locator('#format').inputValue()).toBe('Audio only');
+    expect(await page.locator('#search-query').inputValue()).toBe('');
+    expect(await page.evaluate(() => window.surpriseCalls.length)).toBe(4);
+    const names = await rows.locator('td:first-child').allTextContents();
+    expect(new Set(names).size).toBe(50);
+    expect(names.every((name) => Number(name.match(/Track (\d+)/)[1]) >= 80)).toBe(true);
+    // Selection and Download All must continue to work with translated labels.
+    await rows.first().click();
+    await rows.nth(4).click({ modifiers: ['Shift'] });
+    await expect(page.locator('.detail-actions button.primary')).toHaveText(catalogs[code]['⇩ Download All']);
+    await expect(page.locator('.detail-actions button.primary')).toBeEnabled();
+  });
+}
+
 for (const platform of ['android', 'linux']) {
   test(`Napstrfy ${platform}: opening screen has a readable language selector without a dialog`, async ({ page }) => {
     await mockNative(page, { paired: false, platform });
@@ -301,10 +418,82 @@ test('Napstrfy banners expire after ten seconds and replacement errors get a fre
   await expect(page.locator('.error-banner')).toHaveCount(0);
 });
 
+test('Napstrfy artwork fills visible rows beyond 24 and the player without changing screens', async ({ page }) => {
+  await mockNative(page);
+  await page.route('**/fixture.wav', serveAudio);
+  await page.addInitScript(() => {
+    localStorage.setItem('napstrfy-artwork:rancid\u0000indestructible', '');
+    localStorage.setItem('napstrfy-artwork:rancid\u0000desktop', '');
+    const invoke = window.__TAURI_INTERNALS__.invoke;
+    const tracks = Array.from({ length: 40 }, (_, index) => ({ fileId: index.toString(16).padStart(64, '0'),
+      filename: `Song ${index}.wav`, title: index === 30 ? 'Adina' : `Song ${index}`, artist: 'Rancid',
+      album: index === 30 ? 'Desktop' : 'Indestructible', format: 'WAV', mime: 'audio/wav',
+      size: 1234567, tags: '', local: true, sources: [] }));
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (cmd === 'cached_library') return { paired: true, connected: true, tracks, total: tracks.length };
+      if (cmd === 'remote_library') return { tracks, total: tracks.length };
+      return invoke(cmd, args);
+    };
+  });
+  const id = (n) => `00000000-0000-0000-0000-${String(n).padStart(12, '0')}`;
+  const credits = [{ name: 'Rancid' }];
+  const release = (n, title) => ({ id: id(n + 100), title, status: 'Official', 'artist-credit': credits,
+    'release-group': { id: id(n), 'primary-type': 'Album' } });
+  const queries = [];
+  await page.route('https://musicbrainz.org/**', async (route) => {
+    const url = new URL(route.request().url());
+    const query = url.searchParams.get('query');
+    queries.push(query);
+    const data = url.pathname.includes('/recording/')
+      ? { recordings: [{ title: 'Adina', 'artist-credit': credits, releases: [release(3, 'Rancid')] }] }
+      : { releases: query.includes('Desktop') ? [] : [release(1, 'Indestructible'), release(2, 'Indestructible')] };
+    await route.fulfill({ json: data });
+  });
+  const art = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
+  await page.route('https://coverartarchive.org/**', (route) => route.request().url().includes(id(1))
+    ? route.fulfill({ status: 404 }) : route.fulfill({ contentType: 'image/png', body: art }));
+  await page.goto('http://127.0.0.1:15174');
+  const rows = page.locator('.track-row');
+  await expect(rows).toHaveCount(40);
+  await expect(rows.first().locator('.artwork img')).not.toHaveClass('fallback');
+  expect(queries).toHaveLength(1);
+  await rows.nth(30).scrollIntoViewIfNeeded();
+  await expect(rows.nth(30).locator('.artwork img')).toHaveAttribute('src', new RegExp(id(3)));
+  await rows.nth(30).locator('.track-open').click();
+  await expect(page.locator('.now-playing .artwork img')).toHaveAttribute('src', new RegExp(id(3)));
+  await expect(page.locator('.player-backdrop span')).toHaveCSS('background-image', new RegExp(id(3)));
+  expect(queries).toHaveLength(3);
+});
+
+test('Napstrfy artwork recovers from a transient lookup failure while the screen stays open', async ({ page }) => {
+  await mockNative(page);
+  await page.clock.install();
+  let online = false;
+  let lookups = 0;
+  await page.route('https://musicbrainz.org/**', (route) => {
+    lookups++;
+    return route.fulfill(online ? { json: { releases: [{ id: '00000000-0000-0000-0000-000000000001',
+      title: 'User album', 'artist-credit': [{ name: 'Settings' }] }] } } : { status: 500 });
+  });
+  await page.route('https://coverartarchive.org/**', (route) => route.fulfill({ contentType: 'image/png',
+    body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64') }));
+  await page.goto('http://127.0.0.1:15174');
+  await expect.poll(() => lookups).toBe(1);
+  await page.clock.runFor(1200);
+  await expect.poll(() => lookups).toBe(2);
+  await expect(page.locator('.track-row .artwork img')).toHaveClass('fallback');
+  // Let the failed title request settle before advancing its retry timer.
+  await page.waitForTimeout(100);
+  online = true;
+  await page.clock.runFor(61_000);
+  await expect(page.locator('.track-row .artwork img')).not.toHaveClass('fallback');
+  expect(lookups).toBe(3);
+});
+
 test('Napstrfy desktop player occupies its own column with artwork, likes and playback modes', async ({ page }) => {
   await mockNative(page);
   await page.addInitScript(() => {
-    localStorage.setItem('napstrfy-artwork:settings\u0000user album', '/napstr-logo-small.png');
+    localStorage.setItem('napstrfy-artwork:v2:' + JSON.stringify(['album', 'settings', 'useralbum']), JSON.stringify({ url: '/napstr-logo-small.png', expires: Date.now() + 86400000 }));
   });
   await page.route('**/fixture.wav', serveAudio);
   await page.goto('http://127.0.0.1:15174');

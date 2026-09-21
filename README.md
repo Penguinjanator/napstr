@@ -44,9 +44,21 @@ npm run bundle
 Napstr automatically downloads and verifies the pinned official Tor Expert
 Bundle for your platform before building.
 
-macOS release DMGs are ad-hoc-signed community builds and require no Apple
-Developer account. After the first blocked launch, open **System Settings →
-Privacy & Security → Open Anyway**. Apple Silicon and Intel builds both include Tor.
+On macOS, build a verified DMG and SHA-256 checksum with:
+
+```bash
+npm run macos-build         # Ad-hoc community build; no Apple credentials
+npm run macos-build:signed  # Developer ID signed, notarized, and stapled
+```
+
+Both commands build for the current Mac's native architecture and include Tor.
+Signed builds read the private root `.env.macos-release` file. Neither command
+publishes a release. See [macOS release setup](docs/macos-releases.md) for
+credentials, output paths, verification, and the equivalent Napstrfy commands.
+
+GitHub release DMGs are signed and notarized for Apple Silicon and Intel.
+Local community builds still require **System Settings → Privacy & Security →
+Open Anyway** after the first blocked launch.
 
 ## Implemented architecture
 

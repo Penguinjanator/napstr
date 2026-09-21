@@ -148,13 +148,43 @@ Configure the six names above as repository Actions secrets accessible to
 `lnbits/napstr`. The same names are used by LNbits, but secrets restricted to
 that repository are not automatically available here.
 
-`release.yml` runs signed Napstr builds on `macos-15` (Apple Silicon) and
-`macos-15-intel`. `napstrfy-desktop.yml` runs signed Napstrfy builds for tags and
+`release.yml` handles both Napstr release builds and optional macOS test builds
+on `macos-15` (Apple Silicon) and `macos-15-intel`. A `v*` tag or a manual run with
+`release_tag` set runs the full Napstr desktop and Napstrfy Android release process.
+`napstrfy-desktop.yml` runs signed Napstrfy desktop builds for tags and
 manual runs; its pull-request builds use community signatures without secrets.
 Manual Napstrfy runs on a branch produce workflow artifacts; tagged runs attach
 them to the draft release. Existing `v*` release triggers are preserved.
 
-Both workflows invoke the same npm commands with `--ci`, which reads credentials
+For Napstr testing without creating a release, prefix a PR title with `[build]`,
+for example `[build] Fix audio playback`. The `macos_test` job in `release.yml` builds
+Intel and Apple Silicon installers when that PR opens, reopens, receives new
+commits, or has its title edited. Adding the prefix to an existing PR starts a
+build; removing it skips subsequent builds. Description-only edits do not build.
+There is no changed-file filter: the title flag controls whether a PR builds.
+PRs skip the release jobs, including Linux, Windows, Android, and release uploads.
+
+Same-repository PRs use the six Apple signing secrets to create signed installers.
+Fork PRs, Dependabot-authored PRs, and runs triggered by Dependabot use ad-hoc
+signatures without Apple credentials. Those artifacts end in `-unsigned` and may
+show Gatekeeper's unverified-developer warning. PRs without `[build]` skip the
+Napstr macOS build job.
+
+You can also use **Actions → Build Napstr desktop and Napstrfy Android installers
+→ Run workflow**, select a branch, and leave `release_tag` empty for a signed
+macOS test build. Setting `release_tag` instead runs the full release process.
+Signed PR and manual test runs produce these artifacts:
+
+- `Napstr-macOS-Intel-signed`
+- `Napstr-macOS-Apple-Silicon-signed`
+
+Download the artifact for your Mac from the completed run, extract it, and open
+the enclosed DMG. It includes a SHA-256 checksum. The version comes from the
+selected branch's Tauri configuration; no release tag is required or created.
+The workflow must first exist on the default branch to enable manual runs; see
+[GitHub's manual-run documentation](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow).
+
+All signed workflows invoke the same npm commands with `--ci`, which reads credentials
 from the environment instead of a local file. Cleanup runs with `always()`
 before upload. DMGs and checksum files are uploaded only after successful
 verification and cleanup. Release publication remains a separate action.

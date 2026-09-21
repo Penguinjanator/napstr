@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  checksum, cleanEnvironment, credentialNames, libraryChanges, nativeFiles,
+  checksum, cleanEnvironment, configureRustToolchain, credentialNames, libraryChanges, nativeFiles,
   notarize, parseCredentials, parseOptions, Runner, selectIdentity, Session,
   validateCredentials, withCleanup
 } from '../scripts/macos-release.mjs';
@@ -48,6 +48,63 @@ test('build processes cannot inherit signing credentials or automatic Tauri sign
   const runner = new Runner(credentials);
   for (const name of credentialNames) assert.equal(runner.environment[name], undefined);
   assert.equal(runner.redact(`failed with ${credentials.P12_PASSWORD}`), 'failed with [REDACTED]');
+});
+
+async function fakeRust(directory) {
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, 'cargo'), '#!/bin/sh\nexec rustc "$@"\n', { mode: 0o755 });
+  await writeFile(join(directory, 'rustc'), '#!/bin/sh\nprintf "fixture compiler\\n"\n', { mode: 0o755 });
+}
+
+function rustRunner(directory) {
+  const runner = new Runner();
+  runner.environment = { PATH: directory, HOME: directory, CARGO_HOME: join(directory, 'cargo home') };
+  return runner;
+}
+
+const posixOnly = { skip: process.platform === 'win32' };
+
+test('Rust discovery preserves an existing Cargo on PATH', posixOnly, async (t) => {
+  const directory = await temporary(t);
+  await fakeRust(directory);
+  const runner = rustRunner(directory);
+  await configureRustToolchain(runner, directory);
+  assert.equal(runner.environment.PATH, directory);
+  assert.equal((await runner.run('Fixture Cargo', 'cargo', ['--version'], { cwd: directory, quiet: true })).stdout.trim(), 'fixture compiler');
+});
+
+test('Rust discovery adds CARGO_HOME/bin for Cargo and its compiler subprocesses', posixOnly, async (t) => {
+  const directory = await temporary(t);
+  const runner = rustRunner(directory);
+  await fakeRust(join(runner.environment.CARGO_HOME, 'bin'));
+  await configureRustToolchain(runner, directory);
+  assert.equal((await runner.run('Fixture Cargo', 'cargo', ['--version'], { cwd: directory, quiet: true })).stdout.trim(), 'fixture compiler');
+});
+
+test('missing Cargo proxies are resolved through rustup in the Rust project directory', posixOnly, async (t) => {
+  const directory = await temporary(t);
+  const project = join(directory, 'project/src-tauri');
+  await mkdir(project, { recursive: true });
+  const runner = rustRunner(directory);
+  runner.environment.RUSTUP_HOME = join(directory, 'rust home');
+  runner.environment.RUSTUP_TOOLCHAIN = 'configured-toolchain';
+  runner.environment.EXPECTED_PROJECT = await realpath(project);
+  const bin = join(runner.environment.RUSTUP_HOME, 'toolchains/configured-toolchain/bin');
+  await fakeRust(bin);
+  await writeFile(join(directory, 'rustup'), '#!/bin/sh\n[ "$PWD" = "$EXPECTED_PROJECT" ] && [ "$1" = which ] || exit 1\nprintf "%s/toolchains/%s/bin/%s\\n" "$RUSTUP_HOME" "$RUSTUP_TOOLCHAIN" "$2"\n', { mode: 0o755 });
+  await configureRustToolchain(runner, project);
+  assert.equal((await runner.run('Fixture Cargo', 'cargo', ['--version'], { cwd: project, quiet: true })).stdout.trim(), 'fixture compiler');
+  assert.equal((await runner.run('Fixture compiler', 'rustc', ['--version'], { cwd: project, quiet: true })).stdout.trim(), 'fixture compiler');
+});
+
+test('Rust discovery reports missing tools and preserves rustup selection failures', posixOnly, async (t) => {
+  const directory = await temporary(t);
+  const runner = rustRunner(directory);
+  // An unexecutable file is not a usable Cargo installation.
+  await writeFile(join(directory, 'cargo'), 'not executable', { mode: 0o644 });
+  await assert.rejects(configureRustToolchain(runner, directory), /Install Rust from https:\/\/rustup.rs/);
+  await writeFile(join(directory, 'rustup'), '#!/bin/sh\nprintf "selected toolchain is missing\\n" >&2\nexit 1\n', { mode: 0o755 });
+  await assert.rejects(configureRustToolchain(runner, directory), /selected toolchain is missing/);
 });
 
 test('identity selection rejects missing, ambiguous, wrong-team and invalid certificates', () => {

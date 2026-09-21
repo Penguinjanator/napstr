@@ -14,6 +14,14 @@ builds. Run `npm ci` in the application directory first. Cross-compilation and
 Rosetta are deliberately unsupported by this helper; build each architecture
 on a corresponding Mac or GitHub runner.
 
+The helper uses Cargo from `PATH`, then checks `$CARGO_HOME/bin` (normally
+`~/.cargo/bin`). If the Cargo launcher is missing, it asks `rustup` for the active
+toolchain and makes its Cargo and compiler available to build subprocesses.
+This preserves [Rustup's toolchain selection](https://rust-lang.github.io/rustup/overrides.html),
+including project overrides and `RUSTUP_TOOLCHAIN`, without editing shell settings.
+If neither Cargo nor Rustup is installed, install Rust from https://rustup.rs and
+reopen your terminal before retrying.
+
 ## Local commands
 
 From the repository root:

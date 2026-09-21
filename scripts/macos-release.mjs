@@ -3,10 +3,10 @@
 // Shared local/CI packaging. This command never creates or uploads a release.
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
-import { arch, platform, tmpdir } from 'node:os';
-import { basename, dirname, join, relative, resolve, sep } from 'node:path';
+import { constants, createReadStream } from 'node:fs';
+import { access, chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { arch, homedir, platform, tmpdir } from 'node:os';
+import { basename, delimiter, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -59,6 +59,48 @@ export function cleanEnvironment(environment = process.env) {
     !name.startsWith('DYLD_') && !name.startsWith('TAURI_SIGNING_') &&
     !['TAURI_CONFIG', 'NODE_OPTIONS', 'CARGO_BUILD_TARGET'].includes(name)
   ));
+}
+
+export async function configureRustToolchain(runner, cwd) {
+  const environment = runner.environment;
+  const path = environment.PATH || '';
+  const cargoBin = resolve(cwd, environment.CARGO_HOME || join(environment.HOME || homedir(), '.cargo'), 'bin');
+  async function findExecutable(name, searchPath) {
+    for (const directory of searchPath.split(delimiter)) {
+      const candidate = resolve(cwd, directory, name);
+      try {
+        await access(candidate, constants.X_OK);
+        if ((await stat(candidate)).isFile()) return candidate;
+      } catch (error) {
+        if (!['ENOENT', 'ENOTDIR', 'EACCES'].includes(error.code)) throw error;
+      }
+    }
+  }
+  const prepend = (directories) => {
+    // Keep npm hooks on this Node installation when adding the Rust tools.
+    environment.PATH = [dirname(process.execPath), ...new Set(directories), path].join(delimiter);
+  };
+  if (await findExecutable('cargo', path)) return;
+  if (await findExecutable('cargo', cargoBin)) {
+    prepend([cargoBin]);
+    return;
+  }
+  const rustup = await findExecutable('rustup', [path, cargoBin].join(delimiter));
+  if (!rustup) {
+    throw new Error('Rust/Cargo was not found. Install Rust from https://rustup.rs, then reopen your terminal and retry. For an existing installation, add its bin directory to PATH or set CARGO_HOME.');
+  }
+  // Ask rustup to honor the active toolchain and project overrides, including
+  // installations that have rustup but are missing the cargo/rustc proxies.
+  const directories = [];
+  for (const tool of ['cargo', 'rustc']) {
+    const result = await runner.run(`Locate Rust ${tool}`, rustup, ['which', tool], { cwd });
+    const executable = result.stdout.trim();
+    if (!executable || !await findExecutable(basename(executable), dirname(executable))) {
+      throw new Error(`Rustup could not locate an executable ${tool}. Repair the active Rust toolchain and retry.`);
+    }
+    directories.push(dirname(executable));
+  }
+  prepend(directories);
 }
 
 export function selectIdentity(output, team) {
@@ -444,6 +486,10 @@ export async function main(args = process.argv.slice(2)) {
   if (native.stdout.trim() === '1') throw new Error('Rosetta builds are not supported; use native Node and a native terminal');
   const expectedArch = arch() === 'arm64' ? 'arm64' : 'x86_64';
   const target = arch() === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin';
+  const rustDirectory = join(product.directory, 'src-tauri');
+  await configureRustToolchain(runner, rustDirectory);
+  await runner.run('Check Rust toolchain', 'cargo', ['--version'], { cwd: rustDirectory });
+  await runner.run('Check Rust compiler', 'rustc', ['--version'], { cwd: rustDirectory });
   const config = JSON.parse(await readFile(join(product.directory, 'src-tauri/tauri.conf.json'), 'utf8'));
   const version = options.tag ? options.tag.slice(1) : config.version;
   if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/.test(version)) throw new Error('Invalid application version');
@@ -462,7 +508,6 @@ export async function main(args = process.argv.slice(2)) {
       await session.prepare();
       const tauri = join(product.directory, 'node_modules/@tauri-apps/cli/tauri.js');
       if (!await exists(tauri)) throw new Error('Install dependencies with npm ci before building');
-      await runner.run('Check Rust toolchain', 'cargo', ['--version']);
       if (product.name === 'Napstr') await runner.run('Prepare pinned Tor bundle', process.execPath, [join(root, 'scripts/prepare-tor-bundle.mjs')], { timeout: 600_000 });
       const override = { version, bundle: { macOS: { signingIdentity: null, hardenedRuntime: options.signed } } };
       // Other platforms may also have local Tor resources; never ship them on Mac.
